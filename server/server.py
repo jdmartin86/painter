@@ -24,17 +24,19 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from PIL import Image
 
 from agent import IMAGE_H, IMAGE_W, RLAgent
+from policy import PolicyAgent
 import vqvae
+
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
 app = FastAPI(title="RL Agent Server")
 
 # One generator
-gen = vqvae.VQVAEGenerator()
+gen   = vqvae.VQVAEGenerator(num_codes=64)
 
 # One agent per connected client (keyed by WebSocket id)
-_agents: Dict[int, RLAgent] = {}
+_agents: Dict[int, PolicyAgent] = {}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -109,7 +111,9 @@ def generate_test_pattern(width: int = 128, height: int = 128) -> str:
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     client_id = id(ws)
-    agent = RLAgent()
+    # agent = RLAgent()
+    agent = PolicyAgent(num_codes=64)
+
     _agents[client_id] = agent
     print(f"[server] client {client_id} connected")
 
@@ -125,33 +129,35 @@ async def websocket_endpoint(ws: WebSocket):
                 if frame is None:
                     continue
 
-                action_idx, log_prob, action_label = agent.select_action(frame)
 
                 # 2. Prepare the Image Action
                 # We send the frame the agent 'saw' or a modified visualization
                 # encoded_action_image = encode_frame(frame) # TODO: Not the action - just a pass-through
                 #encoded_action_image = generate_test_pattern()
-                action_image = gen.generate_image(output_size=128)
+                # action_grid = gen.random_action_grid()       # TODO: replace with agent's output
+
+                action_grid  = agent.select_action(frame)          # (32, 32) from the policy net
+                action_image = gen.decode_actions(action_grid)     # (128, 128, 3) uint8
                 encoded_action_image = encode_frame(action_image)
 
                 # 3. Construct response matching iOS 'ActionMessage' struct
                 response = {
                     "type": "frame",            # Matches the struct 'type' filter
                     "action": encoded_action_image, # This is the base64 string
-                    "label": action_label,      # Extra info for debugging
+                    "action_label": "",
                     "step": agent.stats["steps"],
                 }                
                 await ws.send_text(json.dumps(response))
 
                 # 4. Update policy
-                agent.update()
+                agent.update()                                  # update every step
 
             # ── Human reward ──────────────────────────────────────────────────
             elif msg_type == "reward": # TODO: This needs to be an internal signal with intermittent user input.
-                value = float(msg["value"])
-                agent.record_reward(value)
-                print(f"[server] reward {value:+.1f} received | "
-                      f"stats: {agent.stats}")
+                reward_val = float(msg.get("value", 0)) 
+                agent.record_reward(reward_val)                
+                print(f"[server] reward {reward_val:+.1f} received | "
+                    f"stats: {agent.stats}")
                 
             else:
                 print(f"[server] unknown message type: {msg_type}")
