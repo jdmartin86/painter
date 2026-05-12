@@ -33,6 +33,62 @@ app = FastAPI(title="RL Agent Server")
 _agents: Dict[int, RLAgent] = {}
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def decode_frame(b64_string: str) -> np.ndarray | None:
+    # ... (keep your existing decode_frame code)
+    try:
+        raw_bytes = base64.b64decode(b64_string)
+        image = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+        if image.size != (IMAGE_W, IMAGE_H):
+            image = image.resize((IMAGE_W, IMAGE_H), Image.BILINEAR)
+        return np.array(image, dtype=np.uint8)
+    except Exception as e:
+        print(f"[server] frame decode error: {e}")
+        return None
+
+def encode_frame(frame: np.ndarray) -> str:
+    """
+    Converts a numpy array (H, W, 3) back into a base64 JPEG string 
+    for the iOS client to display.
+    """
+    try:
+        image = Image.fromarray(frame)
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=70) # Quality 70 to save bandwidth
+        return base64.b64encode(buffer.getvalue()).decode("utf-8")
+    except Exception as e:
+        print(f"[server] frame encode error: {e}")
+        return ""
+
+def generate_test_pattern(width: int = 128, height: int = 128) -> str:
+    """
+    Generates a 4-quadrant random color test pattern.
+    Useful for checking image orientation and scaling on iOS.
+    """
+    try:
+        # Create 4 random colors
+        colors = np.random.randint(0, 256, (4, 3), dtype=np.uint8)
+        
+        # Create a blank canvas
+        canvas = np.zeros((height, width, 3), dtype=np.uint8)
+        
+        # Fill quadrants
+        h_mid, w_mid = height // 2, width // 2
+        canvas[0:h_mid, 0:w_mid] = colors[0]     # Top-left
+        canvas[0:h_mid, w_mid:] = colors[1]      # Top-right
+        canvas[h_mid:, 0:w_mid] = colors[2]      # Bottom-left
+        canvas[h_mid:, w_mid:] = colors[3]       # Bottom-right
+        
+        # Standard encoding pipeline
+        image = Image.fromarray(canvas)
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG")
+        return base64.b64encode(buffer.getvalue()).decode("utf-8")
+    except Exception as e:
+        print(f"[server] test pattern error: {e}")
+        return ""
+    
 # ── WebSocket endpoint ────────────────────────────────────────────────────────
 
 @app.websocket("/ws")
@@ -47,7 +103,6 @@ async def websocket_endpoint(ws: WebSocket):
         while True:
             raw = await ws.receive_text()
             msg = json.loads(raw)
-
             msg_type = msg.get("type")
 
             # ── Incoming frame ────────────────────────────────────────────────
@@ -58,16 +113,22 @@ async def websocket_endpoint(ws: WebSocket):
 
                 action_idx, log_prob, action_label = agent.select_action(frame)
 
+                # 2. Prepare the Image Action
+                # We send the frame the agent 'saw' or a modified visualization
+                # encoded_action_image = encode_frame(frame) # TODO: Not the action - just a pass-through
+                encoded_action_image = generate_test_pattern()
+                
+                # 3. Construct response matching iOS 'ActionMessage' struct
                 response = {
-                    "type": "action",
-                    "action": action_label,          # human-readable label for iOS
-                    "value": [float(action_idx)],    # raw index if iOS needs it
+                    "type": "frame",            # Matches the struct 'type' filter
+                    "action": encoded_action_image, # This is the base64 string
+                    "label": action_label,      # Extra info for debugging
                     "step": agent.stats["steps"],
-                }
+                }                
                 await ws.send_text(json.dumps(response))
 
             # ── Human reward ──────────────────────────────────────────────────
-            elif msg_type == "reward":
+            elif msg_type == "reward": # TODO: This needs to be an internal signal with intermittent user input.
                 value = float(msg.get("value", 0.0))
                 agent.record_reward(value)
                 print(f"[server] reward {value:+.1f} received | "

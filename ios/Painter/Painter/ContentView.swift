@@ -7,7 +7,7 @@ import Combine
 final class RLViewModel: ObservableObject {
 
     // UI state
-    @Published var actionText: String = "—"
+    @Published var actionImage: UIImage? = nil
     @Published var isConnected: Bool = false
     @Published var statusMessage: String = "Not connected"
     @Published var framesSent: Int = 0
@@ -71,10 +71,20 @@ extension RLViewModel: CameraManagerDelegate {
 }
 
 // MARK: - WebSocketManagerDelegate
-
 extension RLViewModel: WebSocketManagerDelegate {
     func didReceiveAction(_ action: ActionMessage) {
-        actionText = action.action
+        // 1. Decode the Base64 string from the 'action' field
+        // Note: This happens on a background thread (from the WebSocket)
+        if let imageData = Data(base64Encoded: action.action),
+           let decodedImage = UIImage(data: imageData) {
+            
+            // 2. Switch to Main Thread for UI updates
+            DispatchQueue.main.async {
+                self.actionImage = decodedImage
+            }
+        } else {
+            print("Error: Could not decode image data from action string")
+        }
     }
 
     func didChangeConnectionState(_ connected: Bool) {
@@ -112,67 +122,69 @@ struct CameraPreview: UIViewRepresentable {
 }
 
 // MARK: - ContentView
-
 struct ContentView: View {
-
     @StateObject private var viewModel = RLViewModel()
 
     var body: some View {
         ZStack {
+            // ── Background ──
+            Color.black.ignoresSafeArea()
 
-            // ── Camera feed (full screen background) ──
-            CameraPreview(viewModel: viewModel)
-                .ignoresSafeArea()
-
-            // ── HUD overlay ──
-            VStack {
-
-                // Status bar
-                HStack {
-                    Circle()
-                        .fill(viewModel.isConnected ? Color.green : Color.red)
-                        .frame(width: 10, height: 10)
-                    Text(viewModel.statusMessage)
-                        .font(.caption)
-                        .foregroundStyle(.white)
-                    Spacer()
-                    Text("Frames: \(viewModel.framesSent)")
-                        .font(.caption2)
-                        .foregroundStyle(.white.opacity(0.7))
+            // ── LAYER 1: The Action Image (Scaled to Fit) ──
+            Group {
+                if let uiImage = viewModel.actionImage {
+                    Image(uiImage: uiImage)
+                        .interpolation(.none) // Keeps the agent's pixels crisp
+                        .resizable()
+                        .scaledToFit()
+                } else {
+                    VStack(spacing: 12) {
+                        ProgressView().tint(.white)
+                        Text("Connecting to Agent...")
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.white.opacity(0.6))
+                    }
                 }
-                .padding(.horizontal)
-                .padding(.top, 8)
-                .background(.black.opacity(0.4))
+            }
+            // We do NOT use ignoresSafeArea() here so it stays within the HUD bounds
 
+            // ── LAYER 2: HUD Overlay ──
+            VStack {
+                // Top Status Bar
+                HStack {
+                    HStack{
+                        Circle()
+                            .fill(viewModel.isConnected ? Color.green : Color.red)
+                            .frame(width: 8, height: 8)
+                        Text(viewModel.statusMessage)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.white)
+                            .shadow(radius: 2)
+                        Spacer()
+                    }
+                    Spacer()
+                    
+                    Text("Frame: \(viewModel.framesSent)")
+                }
+                .font(.system(size: 12, weight: .bold, design: .monospaced))
+                .foregroundStyle(.white)
+                .padding()
+                .background(Color.black.opacity(0.5))
+                
                 Spacer()
 
-                // Agent action display
-                VStack(spacing: 4) {
-                    Text("Agent Action")
-                        .font(.caption)
-                        .foregroundStyle(.white.opacity(0.7))
-                    Text(viewModel.actionText)
-                        .font(.system(size: 28, weight: .bold, design: .rounded))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 20)
-                        .padding(.vertical, 10)
-                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
-                }
-                .padding(.bottom, 24)
-
-                // Reward buttons
-                HStack(spacing: 32) {
-//                    RewardButton(label: "👎", color: .red) {
-//                        viewModel.sendReward(-1.0)
-//                    }
+                // Bottom Controls
+                HStack {
+                    Spacer()
                     RewardButton(label: "➕", color: .green) {
                         viewModel.sendReward(+1.0)
                     }
+                    Spacer()
                 }
-                .padding(.bottom, 48)
+                .padding(.bottom, 50)
             }
         }
-        .onAppear  { viewModel.onAppear() }
+        .onAppear { viewModel.onAppear() }
         .onDisappear { viewModel.onDisappear() }
     }
 }
@@ -188,8 +200,8 @@ struct RewardButton: View {
 
     var body: some View {
         Button(action: {
-            withAnimation(.easeOut(duration: 0.15)) { pressed = true }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            withAnimation(.easeOut(duration: 0.1)) { pressed = true }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                 withAnimation { pressed = false }
             }
             action()
@@ -197,14 +209,14 @@ struct RewardButton: View {
             Text(label)
                 .font(.system(size: 36))
                 .frame(width: 72, height: 72)
-                .background(color.opacity(pressed ? 0.9 : 0.5),
-                            in: Circle())
+                .background(color, in: Circle())
                 .scaleEffect(pressed ? 0.92 : 1.0)
+                // Adds a slight light-up effect when pressed
+                .brightness(pressed ? 0.2 : 0)
         }
         .buttonStyle(.plain)
     }
 }
-
 // MARK: - Preview
 
 #Preview {
