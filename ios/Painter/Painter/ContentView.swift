@@ -162,10 +162,10 @@ struct ContentView: View {
 
                 // Reward buttons
                 HStack(spacing: 32) {
-                    RewardButton(label: "👎", color: .red) {
-                        viewModel.sendReward(-1.0)
-                    }
-                    RewardButton(label: "👍", color: .green) {
+//                    RewardButton(label: "👎", color: .red) {
+//                        viewModel.sendReward(-1.0)
+//                    }
+                    RewardButton(label: "➕", color: .green) {
                         viewModel.sendReward(+1.0)
                     }
                 }

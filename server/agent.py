@@ -55,17 +55,14 @@ class PolicyNet(nn.Module):
         Returns:
             logits: shape (num_actions,)
         """
-        # Convolutional encoder
-        x = nn.Conv(features=16, kernel_size=(3, 3), strides=(2, 2))(x)
-        x = nn.relu(x)
         x = nn.Conv(features=32, kernel_size=(3, 3), strides=(2, 2))(x)
         x = nn.relu(x)
         x = nn.Conv(features=32, kernel_size=(3, 3), strides=(2, 2))(x)
         x = nn.relu(x)
-
-        # Flatten → MLP head
+        x = nn.Conv(features=32, kernel_size=(3, 3), strides=(2, 2))(x)
+        x = nn.relu(x)
         x = x.reshape(-1)
-        x = nn.Dense(128)(x)
+        x = nn.Dense(256)(x)
         x = nn.relu(x)
         x = nn.Dense(self.num_actions)(x)
         return x
