@@ -24,10 +24,14 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from PIL import Image
 
 from agent import IMAGE_H, IMAGE_W, RLAgent
+import vqvae
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
 app = FastAPI(title="RL Agent Server")
+
+# One generator
+gen = vqvae.VQVAEGenerator()
 
 # One agent per connected client (keyed by WebSocket id)
 _agents: Dict[int, RLAgent] = {}
@@ -37,23 +41,26 @@ _agents: Dict[int, RLAgent] = {}
 def decode_frame(b64_string: str) -> np.ndarray | None:
     """
     Decode a base64 JPEG string from the iOS client into a
-    uint8 numpy array of shape (IMAGE_H, IMAGE_W, 3).
+    uint8 numpy array of shape (IMAGE_H, IMAGE_W, 1).
     """
     try:
         raw_bytes = base64.b64decode(b64_string)
-        image = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+        # Convert to "L" for 8-bit grayscale (Luminance)
+        image = Image.open(io.BytesIO(raw_bytes)).convert("L")
 
-        # Ensure the image matches the agent's expected input size.
-        # The iOS app already resizes to 128x128, but this guards against
-        # any mismatch.
         if image.size != (IMAGE_W, IMAGE_H):
             image = image.resize((IMAGE_W, IMAGE_H), Image.BILINEAR)
 
-        return np.array(image, dtype=np.uint8)
+        # Convert to numpy array
+        frame = np.array(image, dtype=np.uint8)
+        
+        # RL models usually expect (H, W, C). Add the channel dimension back.
+        return frame[:, :, np.newaxis]
+        
     except Exception as e:
         print(f"[server] frame decode error: {e}")
         return None
-    
+        
 def encode_frame(frame: np.ndarray) -> str:
     """
     Converts a numpy array (H, W, 3) back into a base64 JPEG string 
@@ -95,7 +102,7 @@ def generate_test_pattern(width: int = 128, height: int = 128) -> str:
     except Exception as e:
         print(f"[server] test pattern error: {e}")
         return ""
-    
+
 # ── WebSocket endpoint ────────────────────────────────────────────────────────
 
 @app.websocket("/ws")
@@ -123,8 +130,10 @@ async def websocket_endpoint(ws: WebSocket):
                 # 2. Prepare the Image Action
                 # We send the frame the agent 'saw' or a modified visualization
                 # encoded_action_image = encode_frame(frame) # TODO: Not the action - just a pass-through
-                encoded_action_image = generate_test_pattern()
-                
+                #encoded_action_image = generate_test_pattern()
+                action_image = gen.generate_image(output_size=128)
+                encoded_action_image = encode_frame(action_image)
+
                 # 3. Construct response matching iOS 'ActionMessage' struct
                 response = {
                     "type": "frame",            # Matches the struct 'type' filter

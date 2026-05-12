@@ -30,7 +30,7 @@ from flax.training import train_state
 
 IMAGE_H = 128
 IMAGE_W = 128
-IMAGE_C = 3
+IMAGE_C = 1
 
 # Discrete action space — customise these labels for your task
 ACTION_LABELS = ["forward", "backward", "turn_left", "turn_right", "stop"]
