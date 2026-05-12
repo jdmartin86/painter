@@ -88,7 +88,7 @@ class RolloutBuffer:
     def set_last_reward(self, reward: float) -> None:
         """Assign reward to the most recently added transition."""
         if self.transitions:
-            self.transitions[-1].reward += reward
+            self.transitions[-1].reward = reward
 
     def is_full(self, capacity: int) -> bool:
         return len(self.transitions) >= capacity
@@ -102,11 +102,7 @@ class RolloutBuffer:
         running = 0.0
         for i in reversed(range(len(rewards))):
             running = rewards[i] + gamma * running
-            returns[i] = running
-        # Normalise for training stability
-        std = returns.std()
-        if std > 1e-8:
-            returns = (returns - returns.mean()) / std
+            returns[i] = running        
         return returns
 
 
@@ -149,8 +145,6 @@ class RLAgent:
         self._step = 0
         self._total_updates = 0
 
-    # ── Inference ────────────────────────────────────────────────────────────
-
     def select_action(self, frame: np.ndarray) -> tuple[int, float, str]:
         """
         Args:
@@ -182,11 +176,11 @@ class RLAgent:
         with self._lock:
             self.buffer.set_last_reward(value)
 
-        # Trigger an update if the buffer is full
-        if self.buffer.is_full(BUFFER_SIZE):
-            self._run_update()
-
     # ── Training update ───────────────────────────────────────────────────────
+    def update(self) -> None:
+        # if self.buffer.is_full(BUFFER_SIZE):
+        #     self._run_update()
+        pass
 
     def _run_update(self) -> None:
         """Perform a REINFORCE gradient update in a background thread."""

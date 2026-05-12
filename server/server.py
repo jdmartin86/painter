@@ -34,19 +34,26 @@ _agents: Dict[int, RLAgent] = {}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-
 def decode_frame(b64_string: str) -> np.ndarray | None:
-    # ... (keep your existing decode_frame code)
+    """
+    Decode a base64 JPEG string from the iOS client into a
+    uint8 numpy array of shape (IMAGE_H, IMAGE_W, 3).
+    """
     try:
         raw_bytes = base64.b64decode(b64_string)
         image = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+
+        # Ensure the image matches the agent's expected input size.
+        # The iOS app already resizes to 128x128, but this guards against
+        # any mismatch.
         if image.size != (IMAGE_W, IMAGE_H):
             image = image.resize((IMAGE_W, IMAGE_H), Image.BILINEAR)
+
         return np.array(image, dtype=np.uint8)
     except Exception as e:
         print(f"[server] frame decode error: {e}")
         return None
-
+    
 def encode_frame(frame: np.ndarray) -> str:
     """
     Converts a numpy array (H, W, 3) back into a base64 JPEG string 
@@ -107,7 +114,7 @@ async def websocket_endpoint(ws: WebSocket):
 
             # ── Incoming frame ────────────────────────────────────────────────
             if msg_type == "frame":
-                frame = decode_frame(msg["data"])
+                frame = decode_frame(msg["data"]) 
                 if frame is None:
                     continue
 
@@ -127,13 +134,16 @@ async def websocket_endpoint(ws: WebSocket):
                 }                
                 await ws.send_text(json.dumps(response))
 
+                # 4. Update policy
+                agent.update()
+
             # ── Human reward ──────────────────────────────────────────────────
             elif msg_type == "reward": # TODO: This needs to be an internal signal with intermittent user input.
-                value = float(msg.get("value", 0.0))
+                value = float(msg["value"])
                 agent.record_reward(value)
                 print(f"[server] reward {value:+.1f} received | "
                       f"stats: {agent.stats}")
-
+                
             else:
                 print(f"[server] unknown message type: {msg_type}")
 
@@ -162,26 +172,3 @@ def stats():
         client_id: agent.stats
         for client_id, agent in _agents.items()
     }
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def decode_frame(b64_string: str) -> np.ndarray | None:
-    """
-    Decode a base64 JPEG string from the iOS client into a
-    uint8 numpy array of shape (IMAGE_H, IMAGE_W, 3).
-    """
-    try:
-        raw_bytes = base64.b64decode(b64_string)
-        image = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
-
-        # Ensure the image matches the agent's expected input size.
-        # The iOS app already resizes to 128x128, but this guards against
-        # any mismatch.
-        if image.size != (IMAGE_W, IMAGE_H):
-            image = image.resize((IMAGE_W, IMAGE_H), Image.BILINEAR)
-
-        return np.array(image, dtype=np.uint8)
-    except Exception as e:
-        print(f"[server] frame decode error: {e}")
-        return None
