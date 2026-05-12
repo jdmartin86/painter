@@ -26,8 +26,8 @@ final class CameraManager: NSObject {
 
     private let captureSession = AVCaptureSession()
     private let videoOutput = AVCaptureVideoDataOutput()
-    private let sessionQueue = DispatchQueue(label: "com.rlapp.camera.session")
-    private let outputQueue = DispatchQueue(label: "com.rlapp.camera.output")
+    private let sessionQueue = DispatchQueue(label: "com.johnmartin.Painter.camera.session")
+    private let outputQueue = DispatchQueue(label: "com.johnmartin.Painter.camera.output")
     private let ciContext = CIContext()
 
     private var lastSentTime: CFTimeInterval = 0

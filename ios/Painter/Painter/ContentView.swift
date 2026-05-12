@@ -1,10 +1,10 @@
 import SwiftUI
 import AVFoundation
+import Combine
 
 // MARK: - ViewModel
 
-@MainActor
-final class RLViewModel: NSObject, ObservableObject {
+final class RLViewModel: ObservableObject {
 
     // UI state
     @Published var actionText: String = "—"
@@ -17,10 +17,9 @@ final class RLViewModel: NSObject, ObservableObject {
     private let wsManager = WebSocketManager()
 
     // Change this to your server's address
-    private let serverURL = "ws://192.168.1.x:8000/ws"
-    
-    override init() {
-        super.init()
+    private let serverURL = "ws://192.168.86.249:8000/ws"
+
+    init() {
         cameraManager.delegate = self
         wsManager.delegate = self
     }
@@ -35,7 +34,9 @@ final class RLViewModel: NSObject, ObservableObject {
                 self.cameraManager.startCapture()
                 self.wsManager.connect(to: self.serverURL)
             case .failure(let error):
-                self.statusMessage = error.localizedDescription
+                DispatchQueue.main.async {
+                    self.statusMessage = error.localizedDescription
+                }
             }
         }
     }
@@ -61,10 +62,10 @@ final class RLViewModel: NSObject, ObservableObject {
 // MARK: - CameraManagerDelegate
 
 extension RLViewModel: CameraManagerDelegate {
-    nonisolated func didCaptureFrame(_ jpegData: Data) {
-        Task { @MainActor in
-            wsManager.sendFrame(jpegData)
-            framesSent += 1
+    func didCaptureFrame(_ jpegData: Data) {
+        wsManager.sendFrame(jpegData)
+        DispatchQueue.main.async {
+            self.framesSent += 1
         }
     }
 }
@@ -80,10 +81,9 @@ extension RLViewModel: WebSocketManagerDelegate {
         isConnected = connected
         statusMessage = connected ? "Connected" : "Disconnected — retrying…"
         if !connected {
-            // Simple reconnect after 2 seconds
-            Task {
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
-                wsManager.connect(to: serverURL)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                guard let self else { return }
+                self.wsManager.connect(to: self.serverURL)
             }
         }
     }

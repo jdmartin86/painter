@@ -1,0 +1,8 @@
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+websockets>=12.0
+jax[cpu]>=0.4.25        # swap for jax[cuda12] on a GPU machine
+flax>=0.8.4
+optax>=0.2.2
+Pillow>=10.3.0
+numpy>=1.26.0

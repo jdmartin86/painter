@@ -15,7 +15,7 @@ struct RewardMessage: Encodable {
 }
 
 struct ActionMessage: Decodable {
-    let type: String
+    let type: String          // TODO: This should be an image too.
     let action: String        // display string from the agent
     let value: [Float]?       // optional raw action vector
 }
