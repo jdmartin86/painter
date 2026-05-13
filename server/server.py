@@ -111,10 +111,11 @@ def generate_test_pattern(width: int = 128, height: int = 128) -> str:
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     client_id = id(ws)
-    # agent = RLAgent()
     agent = PolicyAgent(num_codes=64)
-
     _agents[client_id] = agent
+    
+    # Track the "running" reward value between frames
+    pending_reward = 0.0
     print(f"[server] client {client_id} connected")
 
     try:
@@ -123,41 +124,46 @@ async def websocket_endpoint(ws: WebSocket):
             msg = json.loads(raw)
             msg_type = msg.get("type")
 
-            # ── Incoming frame ────────────────────────────────────────────────
-            if msg_type == "frame":
+            # ── Human reward (Buffered) ──────────────────────────────────────
+            if msg_type == "reward":
+                val = float(msg.get("value", 0))
+                pending_reward += val
+                print(f"[server] buffered human feedback: {val:+.1f} | total pending: {pending_reward:+.1f}")
+                continue # Wait for frame to process and apply
+
+            # ── Incoming frame (The "Step") ──────────────────────────────────
+            elif msg_type == "frame":
                 frame = decode_frame(msg["data"]) 
                 if frame is None:
                     continue
 
+                # 1. Apply the reward (defaults to 0.0 if reward branch wasn't hit)
+                current_step_reward = pending_reward
+                agent.record_reward(current_step_reward)                
 
-                # 2. Prepare the Image Action
-                # We send the frame the agent 'saw' or a modified visualization
-                # encoded_action_image = encode_frame(frame) # TODO: Not the action - just a pass-through
-                #encoded_action_image = generate_test_pattern()
-                # action_grid = gen.random_action_grid()       # TODO: replace with agent's output
-
-                action_grid  = agent.select_action(frame)          # (32, 32) from the policy net
-                action_image = gen.decode_actions(action_grid)     # (128, 128, 3) uint8
+                # 2. Select action based on the current frame
+                action_grid  = agent.select_action(frame)
+                action_image = gen.decode_actions(action_grid)
                 encoded_action_image = encode_frame(action_image)
 
                 # 3. Construct response matching iOS 'ActionMessage' struct
                 response = {
-                    "type": "frame",            # Matches the struct 'type' filter
-                    "action": encoded_action_image, # This is the base64 string
-                    "action_label": "",
+                    "type": "frame",
+                    "action": encoded_action_image,
+                    "action_label": f"R: {current_step_reward:+.1f}",
                     "step": agent.stats["steps"],
                 }                
                 await ws.send_text(json.dumps(response))
 
                 # 4. Update policy
-                agent.update()                                  # update every step
+                agent.update()
 
-            # ── Human reward ──────────────────────────────────────────────────
-            elif msg_type == "reward": # TODO: This needs to be an internal signal with intermittent user input.
-                reward_val = float(msg.get("value", 0)) 
-                agent.record_reward(reward_val)                
-                print(f"[server] reward {reward_val:+.1f} received | "
-                    f"stats: {agent.stats}")
+                # 5. RESTORED: Status Prints
+                print(f"[server] step {agent.stats['steps']} | reward {current_step_reward:+.1f} applied | "
+                      f"stats: {agent.stats}")
+                
+                # 6. Reset buffer for next frame
+                pending_reward = 0.0
                 
             else:
                 print(f"[server] unknown message type: {msg_type}")
@@ -168,8 +174,7 @@ async def websocket_endpoint(ws: WebSocket):
         print(f"[server] error for client {client_id}: {e}")
     finally:
         _agents.pop(client_id, None)
-
-
+        
 # ── HTTP health check ─────────────────────────────────────────────────────────
 
 @app.get("/health")
