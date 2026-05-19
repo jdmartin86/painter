@@ -109,14 +109,15 @@ async def websocket_endpoint(ws: WebSocket):
                 break
 
             # ── BRANCH A: Handle Human Async Reward Tap (Text Message) ───────
+            current_step_reward = 0.
             if "text" in websocket_msg:
                 text_data = websocket_msg["text"]
                 try:
                     msg = json.loads(text_data)
                     if msg.get("type") == "reward":
-                        val = float(msg.get("value", 0))
-                        pending_reward += val
-                        print(f"[server] buffered reward: {val:+.1f} | total pending: {pending_reward:+.1f}")
+                        current_step_reward = float(msg.get("value", 0))
+                        agent.record_reward(current_step_reward)                
+                        print(f"[server] buffered reward: {current_step_reward:+.1f} | total pending: {pending_reward:+.1f}")
                 except Exception as json_err:
                     print(f"[server] json parse error: {json_err}")
                 continue
@@ -132,10 +133,6 @@ async def websocket_endpoint(ws: WebSocket):
                 if frame is None:
                     print("[server] Warning: Frame processing returned empty array layout.")
                     continue
-
-                # 1. Inject Buffered rewards
-                current_step_reward = pending_reward
-                agent.record_reward(current_step_reward)                
 
                 # 2. Select model actions
                 chosen_code, active_position = agent.select_action(frame)
