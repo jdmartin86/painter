@@ -2,26 +2,18 @@ import AVFoundation
 import UIKit
 import CoreImage
 
-// MARK: - Delegate
+// MARK: - Camera Manager Implementation
 
 protocol CameraManagerDelegate: AnyObject {
-    /// Called at most once per (1 / targetFPS) seconds on the main queue.
     func didCaptureFrame(_ jpegData: Data)
 }
-
-// MARK: - Manager
 
 final class CameraManager: NSObject {
 
     weak var delegate: CameraManagerDelegate?
 
-    // Target frame rate sent to the server (not the capture rate)
-    var targetFPS: Double = 5.0
-
-    // Resolution to resize frames to before encoding (keeps payload small)
+    var targetFPS: Double = 30.0
     var outputSize = CGSize(width: 128, height: 128)
-
-    // JPEG compression quality  0.0–1.0
     var jpegQuality: CGFloat = 0.6
 
     private let captureSession = AVCaptureSession()
@@ -32,16 +24,11 @@ final class CameraManager: NSObject {
 
     private var lastSentTime: CFTimeInterval = 0
 
-    // MARK: - Setup
-
-    /// Call once, e.g. in viewDidLoad. Requests camera permission first.
     func setup(completion: @escaping (Result<Void, Error>) -> Void) {
         AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
-            guard let self else { return }
+            guard let self = self else { return }
             guard granted else {
-                DispatchQueue.main.async {
-                    completion(.failure(CameraError.permissionDenied))
-                }
+                DispatchQueue.main.async { completion(.failure(CameraError.permissionDenied)) }
                 return
             }
             self.sessionQueue.async {
@@ -57,19 +44,15 @@ final class CameraManager: NSObject {
 
     private func configureSession() throws {
         captureSession.beginConfiguration()
-        captureSession.sessionPreset = .medium  // 480p is plenty; we resize anyway
+        captureSession.sessionPreset = .medium
 
-        // Input
-        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera,
-                                                   for: .video,
-                                                   position: .back),
+        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front),
               let input = try? AVCaptureDeviceInput(device: device),
               captureSession.canAddInput(input) else {
             throw CameraError.deviceUnavailable
         }
         captureSession.addInput(input)
 
-        // Output
         videoOutput.setSampleBufferDelegate(self, queue: outputQueue)
         videoOutput.alwaysDiscardsLateVideoFrames = true
         videoOutput.videoSettings = [
@@ -80,7 +63,6 @@ final class CameraManager: NSObject {
         }
         captureSession.addOutput(videoOutput)
 
-        // Lock orientation to portrait (adjust if needed)
         if let connection = videoOutput.connection(with: .video) {
             if connection.isVideoRotationAngleSupported(90) {
                 connection.videoRotationAngle = 90
@@ -90,23 +72,20 @@ final class CameraManager: NSObject {
         captureSession.commitConfiguration()
     }
 
-    // MARK: - Start / Stop
-
     func startCapture() {
         sessionQueue.async { [weak self] in
+            guard self?.captureSession.isRunning == false else { return }
             self?.captureSession.startRunning()
         }
     }
 
     func stopCapture() {
         sessionQueue.async { [weak self] in
+            guard self?.captureSession.isRunning == true else { return }
             self?.captureSession.stopRunning()
         }
     }
 
-    // MARK: - Preview layer
-
-    /// Add the returned layer to your view's layer to show the live preview.
     func makePreviewLayer(for bounds: CGRect) -> AVCaptureVideoPreviewLayer {
         let layer = AVCaptureVideoPreviewLayer(session: captureSession)
         layer.frame = bounds
@@ -124,7 +103,6 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         didOutput sampleBuffer: CMSampleBuffer,
         from connection: AVCaptureConnection
     ) {
-        // Throttle to targetFPS
         let now = CACurrentMediaTime()
         let interval = 1.0 / targetFPS
         guard now - lastSentTime >= interval else { return }
@@ -137,24 +115,22 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         }
     }
 
-    // MARK: - Frame processing
-
     private func process(_ sampleBuffer: CMSampleBuffer) -> Data? {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return nil }
 
         let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
 
-        // Scale to outputSize
         let scaleX = outputSize.width  / ciImage.extent.width
         let scaleY = outputSize.height / ciImage.extent.height
-        let scaled = ciImage.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
+        let scaledImage = ciImage.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
 
-        // Render to CGImage
-        guard let cgImage = ciContext.createCGImage(scaled, from: scaled.extent) else { return nil }
-
-        // Encode as JPEG
-        let uiImage = UIImage(cgImage: cgImage)
-        return uiImage.jpegData(compressionQuality: jpegQuality)
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let qualityKey = CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String)
+        let options: [CIImageRepresentationOption: Any] = [
+            qualityKey: jpegQuality
+        ]
+        
+        return ciContext.jpegRepresentation(of: scaledImage, colorSpace: colorSpace, options: options)
     }
 }
 

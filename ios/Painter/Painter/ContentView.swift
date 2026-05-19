@@ -1,6 +1,7 @@
 import SwiftUI
 import AVFoundation
 import Combine
+import UIKit
 
 // MARK: - ViewModel
 
@@ -13,8 +14,8 @@ final class RLViewModel: ObservableObject {
     @Published var framesSent: Int = 0
 
     // Sub-managers
-    private let cameraManager = CameraManager()
-    private let wsManager = WebSocketManager()
+    let cameraManager = CameraManager()
+    let wsManager = WebSocketManager()
 
     // Change this to your server's address
     private let serverURL = "ws://192.168.86.249:8000/ws"
@@ -28,10 +29,11 @@ final class RLViewModel: ObservableObject {
 
     func onAppear() {
         cameraManager.setup { [weak self] result in
-            guard let self else { return }
+            guard let self = self else { return }
             switch result {
             case .success:
-                self.cameraManager.startCapture()
+                // Start by establishing network state before launching camera frames
+                self.statusMessage = "Connecting..."
                 self.wsManager.connect(to: self.serverURL)
             case .failure(let error):
                 DispatchQueue.main.async {
@@ -70,30 +72,35 @@ extension RLViewModel: CameraManagerDelegate {
     }
 }
 
-// MARK: - WebSocketManagerDelegate
+// MARK: - WebSocketManagerDelegate Implementation
+
 extension RLViewModel: WebSocketManagerDelegate {
-    func didReceiveAction(_ action: ActionMessage) {
-        // 1. Decode the Base64 string from the 'action' field
-        // Note: This happens on a background thread (from the WebSocket)
-        if let imageData = Data(base64Encoded: action.action),
-           let decodedImage = UIImage(data: imageData) {
-            
-            // 2. Switch to Main Thread for UI updates
-            DispatchQueue.main.async {
-                self.actionImage = decodedImage
-            }
-        } else {
-            print("Error: Could not decode image data from action string")
+    
+    func didReceiveActionImage(_ image: UIImage, step: UInt32, row: UInt8, col: UInt8, reward: Float) {
+        // Silently receive the metadata to keep the network pipeline flowing,
+        // but only publish the image to the UI thread
+        DispatchQueue.main.async { [weak self] in
+            self?.actionImage = image
         }
     }
 
     func didChangeConnectionState(_ connected: Bool) {
-        isConnected = connected
-        statusMessage = connected ? "Connected" : "Disconnected — retrying…"
-        if !connected {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
-                guard let self else { return }
-                self.wsManager.connect(to: self.serverURL)
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.isConnected = connected
+            
+            if connected {
+                self.statusMessage = "Connected"
+                self.cameraManager.startCapture() // Run frame streaming safely
+            } else {
+                self.statusMessage = "Disconnected — retrying…"
+                self.cameraManager.stopCapture()
+                
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                    guard let self = self else { return }
+                    guard !self.isConnected else { return }
+                    self.wsManager.connect(to: self.serverURL)
+                }
             }
         }
     }
@@ -111,7 +118,6 @@ struct CameraPreview: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: UIView, context: Context) {
-        // Add preview layer once the view has a non-zero frame
         guard uiView.bounds != .zero,
               uiView.layer.sublayers?.contains(where: { $0 is AVCaptureVideoPreviewLayer }) == false
         else { return }
@@ -122,6 +128,7 @@ struct CameraPreview: UIViewRepresentable {
 }
 
 // MARK: - ContentView
+
 struct ContentView: View {
     @StateObject private var viewModel = RLViewModel()
 
@@ -146,13 +153,12 @@ struct ContentView: View {
                     }
                 }
             }
-            // We do NOT use ignoresSafeArea() here so it stays within the HUD bounds
 
             // ── LAYER 2: HUD Overlay ──
             VStack {
                 // Top Status Bar
                 HStack {
-                    HStack{
+                    HStack(spacing: 6) {
                         Circle()
                             .fill(viewModel.isConnected ? Color.green : Color.red)
                             .frame(width: 8, height: 8)
@@ -160,8 +166,8 @@ struct ContentView: View {
                             .font(.system(.caption, design: .monospaced))
                             .foregroundStyle(.white)
                             .shadow(radius: 2)
-                        Spacer()
                     }
+                    
                     Spacer()
                     
                     Text("Frame: \(viewModel.framesSent)")
@@ -211,12 +217,12 @@ struct RewardButton: View {
                 .frame(width: 72, height: 72)
                 .background(color, in: Circle())
                 .scaleEffect(pressed ? 0.92 : 1.0)
-                // Adds a slight light-up effect when pressed
                 .brightness(pressed ? 0.2 : 0)
         }
         .buttonStyle(.plain)
     }
 }
+
 // MARK: - Preview
 
 #Preview {

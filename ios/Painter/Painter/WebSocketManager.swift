@@ -1,12 +1,7 @@
 import Foundation
+import UIKit
 
-// MARK: - Message types
-
-struct FrameMessage: Encodable {
-    let type = "frame"
-    let data: String          // base64-encoded JPEG
-    let timestamp: Double
-}
+// MARK: - Outbound Message Types
 
 struct RewardMessage: Encodable {
     let type = "reward"
@@ -14,21 +9,16 @@ struct RewardMessage: Encodable {
     let timestamp: Double
 }
 
-struct ActionMessage: Decodable {
-    let type: String
-    let action: String        // display base64-encoded JPEG from the agent
-}
-
-// MARK: - Delegate
+// MARK: - Delegate Protocol
 
 protocol WebSocketManagerDelegate: AnyObject {
-    func didReceiveAction(_ action: ActionMessage)
+    func didReceiveActionImage(_ image: UIImage, step: UInt32, row: UInt8, col: UInt8, reward: Float)
     func didChangeConnectionState(_ connected: Bool)
 }
 
-// MARK: - Manager
+// MARK: - WebSocket Manager
 
-final class WebSocketManager: NSObject {
+final class WebSocketManager: NSObject, URLSessionWebSocketDelegate {
 
     weak var delegate: WebSocketManagerDelegate?
 
@@ -43,14 +33,15 @@ final class WebSocketManager: NSObject {
         urlSession = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
     }
 
-    // MARK: - Connection
+    // MARK: - Connection Controls
 
     func connect(to urlString: String) {
         guard let url = URL(string: urlString) else {
-            print("WebSocketManager: invalid URL — \(urlString)")
+            print("[WebSocket] Invalid URL layout target: \(urlString)")
             return
         }
         disconnect()
+        print("[WebSocket] Opening pipe to: \(url.absoluteString)")
         webSocketTask = urlSession.webSocketTask(with: url)
         webSocketTask?.resume()
         scheduleReceive()
@@ -62,19 +53,21 @@ final class WebSocketManager: NSObject {
         isConnected = false
     }
 
-    // MARK: - Sending
+    // MARK: - Dual-Channel Transmissions (Saves the Loop)
 
-    /// Call this with a compressed JPEG Data object (already resized to target resolution).
-    func sendFrame(_ jpegData: Data, timestamp: Double = Date().timeIntervalSince1970) {
+    /// Transmits raw binary JPEG frames straight to the Python OpenCV processing array pipeline
+    func sendFrame(_ jpegData: Data) {
         guard isConnected else { return }
 
-        let message = FrameMessage(
-            data: jpegData.base64EncodedString(),
-            timestamp: timestamp
-        )
-        send(encodable: message)
+        // FIX: Strip the JSON text wrapper and send pure binary over the network wire
+        webSocketTask?.send(.data(jpegData)) { error in
+            if let error = error {
+                print("[WebSocket] Binary frame send error: \(error.localizedDescription)")
+            }
+        }
     }
 
+    /// Transmits user reward interaction frames wrapped cleanly as JSON text blocks
     func sendReward(_ value: Float) {
         guard isConnected else { return }
 
@@ -82,89 +75,92 @@ final class WebSocketManager: NSObject {
             value: value,
             timestamp: Date().timeIntervalSince1970
         )
-        send(encodable: message)
+        
+        guard let jsonData = try? encoder.encode(message),
+              let jsonString = String(data: jsonData, encoding: .utf8) else { return }
+
+        // Send as a clear string to trip Python's "text" parsing branch
+        webSocketTask?.send(.string(jsonString)) { error in
+            if let error = error {
+                print("[WebSocket] Reward text send error: \(error.localizedDescription)")
+            }
+        }
     }
 
-    // MARK: - Receiving
+    // MARK: - Receiving Loop Processing
 
     private func scheduleReceive() {
-        webSocketTask?.receive { [weak self] result in
-            guard let self else { return }
+        guard let task = webSocketTask else { return }
+        
+        task.receive { [weak self] result in
+            guard let self = self else { return }
+            defer { self.scheduleReceive() } // Protect execution state loops
+            
             switch result {
             case .success(let message):
-                self.handleMessage(message)
-                self.scheduleReceive()          // keep the receive loop alive
+                switch message {
+                case .data(let data):
+                    self.decodeServerBinaryPayload(data)
+                case .string(let text):
+                    print("[WebSocket] Received text packet frame back from server: \(text)")
+                @unknown default:
+                    break
+                }
             case .failure(let error):
-                print("WebSocketManager receive error: \(error.localizedDescription)")
-                self.isConnected = false
-                self.delegate?.didChangeConnectionState(false)
+                print("[WebSocket] Connection line closed: \(error.localizedDescription)")
+                if self.isConnected {
+                    self.isConnected = false
+                    DispatchQueue.main.async {
+                        self.delegate?.didChangeConnectionState(false)
+                    }
+                }
             }
         }
     }
 
-    private func handleMessage(_ message: URLSessionWebSocketTask.Message) {
-        switch message {
-        case .string(let text):
-            guard let data = text.data(using: .utf8) else { return }
-            decode(data)
-        case .data(let data):
-            decode(data)
-        @unknown default:
-            break
-        }
-    }
-
-    private func decode(_ data: Data) {
-        do {
-            let action = try JSONDecoder().decode(ActionMessage.self, from: data)
+    private func decodeServerBinaryPayload(_ data: Data) {
+        // Validation check based on your server's header requirements:
+        // Python: struct.pack("!IBBf", ...) -> 4 bytes (UInt32) + 1 byte (UInt8) + 1 byte (UInt8) + 4 bytes (Float) = 10 bytes metadata header
+        guard data.count > 10 else { return }
+        
+        // ── EXTRACT METADATA VIA BIG-ENDIAN UNPACKING ──
+        // Step Count (Bytes 0-3)
+        let step: UInt32 = data.subdata(in: 0..<4).withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
+        
+        // Grid Coordinates (Bytes 4 and 5)
+        let row: UInt8 = data[4]
+        let col: UInt8 = data[5]
+        
+        // Reward Float (Bytes 6-9)
+        let rewardBits: UInt32 = data.subdata(in: 6..<10).withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
+        let reward = Float(bitPattern: rewardBits)
+        
+        // Extract remaining raw JPEG byte stream payload
+        let jpegData = data.subdata(in: 10..<data.count)
+        
+        if let decodedImage = UIImage(data: jpegData) {
             DispatchQueue.main.async {
-                self.delegate?.didReceiveAction(action)
+                // Return data elements smoothly back to the UI thread
+                self.delegate?.didReceiveActionImage(decodedImage, step: step, row: row, col: col, reward: reward)
             }
-        } catch {
-            print("WebSocketManager decode error: \(error)")
+        } else {
+            print("[Parser] Failed to process image frame payload array sequence.")
         }
     }
 
-    // MARK: - Helpers
+    // MARK: - URLSessionWebSocketDelegate Protocols
 
-    private func send(encodable: some Encodable) {
-        guard let data = try? encoder.encode(encodable),
-              let text = String(data: data, encoding: .utf8) else { return }
-
-        webSocketTask?.send(.string(text)) { error in
-            if let error {
-                print("WebSocketManager send error: \(error.localizedDescription)")
-            }
-        }
-    }
-}
-
-// MARK: - URLSessionWebSocketDelegate
-
-extension WebSocketManager: URLSessionWebSocketDelegate {
-
-    func urlSession(
-        _ session: URLSession,
-        webSocketTask: URLSessionWebSocketTask,
-        didOpenWithProtocol protocol: String?
-    ) {
+    func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didOpenWithProtocol protocol: String?) {
         isConnected = true
         DispatchQueue.main.async {
             self.delegate?.didChangeConnectionState(true)
         }
-        print("WebSocketManager: connected")
     }
 
-    func urlSession(
-        _ session: URLSession,
-        webSocketTask: URLSessionWebSocketTask,
-        didCloseWith closeCode: URLSessionWebSocketTask.CloseCode,
-        reason: Data?
-    ) {
+    func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
         isConnected = false
         DispatchQueue.main.async {
             self.delegate?.didChangeConnectionState(false)
         }
-        print("WebSocketManager: disconnected (\(closeCode))")
     }
 }
