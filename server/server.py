@@ -23,17 +23,21 @@ import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from PIL import Image
 
-from agent import IMAGE_H, IMAGE_W, RLAgent
 from policy import PolicyAgent
-import vqvae
+import vqvae_mnist as vqvae
+
+IMAGE_H = 128
+IMAGE_W = 128
+IMAGE_C = 1
 
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
 app = FastAPI(title="RL Agent Server")
 
-# One generator
-gen   = vqvae.VQVAEGenerator(num_codes=64)
+# Initialize the generator wrapper with your subset size (e.g., 64)
+# Internally, it loads your trained 7x7 grid VQ-VAE model architecture
+gen = vqvae.VQVAEGenerator(checkpoint_path="vqvae_mnsit.pth", num_codes=64)
 
 # One agent per connected client (keyed by WebSocket id)
 _agents: Dict[int, PolicyAgent] = {}
@@ -65,11 +69,27 @@ def decode_frame(b64_string: str) -> np.ndarray | None:
         
 def encode_frame(frame: np.ndarray) -> str:
     """
-    Converts a numpy array (H, W, 3) back into a base64 JPEG string 
-    for the iOS client to display.
+    Converts a numpy array back into a base64 JPEG string.
+    Automatically handles dimension squeezing, handles grayscale formatting,
+    and upscales clean 28x28 MNIST frames back up to 128x128 for iOS visualization.
     """
     try:
-        image = Image.fromarray(frame)
+        # Drop channel dimension if the array comes out as (28, 28, 1)
+        if frame.ndim == 3 and frame.shape[-1] == 1:
+            frame = frame.squeeze(axis=-1)
+            
+        if frame.dtype != np.uint8:
+            frame = frame.astype(np.uint8)
+
+        # Detect image layout mode (L for grayscale, RGB for color patterns)
+        mode = "L" if frame.ndim == 2 else "RGB"
+        image = Image.fromarray(frame, mode=mode)
+        
+        # Upscale the VQ-VAE's 28x28 output to the 128x128 expected by iOS.
+        # NEAREST preserves crisp, clear individual retro pixels instead of blurry interpolations.
+        if image.size != (IMAGE_W, IMAGE_H):
+            image = image.resize((IMAGE_W, IMAGE_H), Image.NEAREST)
+            
         buffer = io.BytesIO()
         image.save(buffer, format="JPEG", quality=70) # Quality 70 to save bandwidth
         return base64.b64encode(buffer.getvalue()).decode("utf-8")
@@ -111,12 +131,14 @@ def generate_test_pattern(width: int = 128, height: int = 128) -> str:
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     client_id = id(ws)
-    agent = PolicyAgent(num_codes=64)
+    
+    # Dynamically reads gen.num_codes (64) and gen.GRID_SIZE (7) from your new generator setup
+    agent = PolicyAgent(num_codes=gen.num_codes, grid_size=gen.GRID_SIZE)
     _agents[client_id] = agent
     
     # Track the "running" reward value between frames
     pending_reward = 0.0
-    print(f"[server] client {client_id} connected")
+    print(f"[server] client {client_id} connected (Grid Size: {gen.GRID_SIZE}x{gen.GRID_SIZE})")
 
     try:
         while True:
@@ -158,7 +180,7 @@ async def websocket_endpoint(ws: WebSocket):
                 # 4. Update policy
                 agent.update()
 
-                # 5. RESTORED: Status Prints
+                # 5. Status Prints
                 print(f"[server] step {agent.stats['steps']} | reward {current_step_reward:+.1f} applied | "
                       f"stats: {agent.stats}")
                 
