@@ -1,216 +1,186 @@
-"""
-server.py — FastAPI WebSocket server.
-
-Each connected iOS client gets its own agent instance.
-Multiple clients can connect simultaneously (e.g. for testing).
-
-Run:
-    uvicorn server:app --host 0.0.0.0 --port 8000 --reload
-
-Connect from iOS:
-    ws://<your-machine-ip>:8000/ws
-"""
-
 from __future__ import annotations
 
-import base64
 import io
 import json
 import time
+import struct
 from typing import Dict
 
 import numpy as np
+import cv2  
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from PIL import Image
 
 from policy import PolicyAgent
 import vqvae_mnist as vqvae
 
 IMAGE_H = 128
 IMAGE_W = 128
-IMAGE_C = 1
 
-
-# ── App ───────────────────────────────────────────────────────────────────────
+# ── App Initialization ────────────────────────────────────────────────────────
 
 app = FastAPI(title="RL Agent Server")
 
-# Initialize the generator wrapper with your subset size (e.g., 64)
-# Internally, it loads your trained 7x7 grid VQ-VAE model architecture
+# Initialize VQ-VAE model architecture
 gen = vqvae.VQVAEGenerator(checkpoint_path="vqvae_mnsit.pth", num_codes=64)
 
-# One agent per connected client (keyed by WebSocket id)
 _agents: Dict[int, PolicyAgent] = {}
+_grids: Dict[int, np.ndarray] = {}  
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def decode_frame(b64_string: str) -> np.ndarray | None:
+# ── High Speed Frame Processors (No Base64, No PIL) ───────────────────────────
+
+def fast_decode_frame(raw_bytes: bytes) -> np.ndarray | None:
     """
-    Decode a base64 JPEG string from the iOS client into a
-    uint8 numpy array of shape (IMAGE_H, IMAGE_W, 1).
+    Directly converts raw JPEG bytes into a uint8 numpy array using OpenCV.
+    Bypasses base64 string decoding and PIL image allocation entirely.
     """
     try:
-        raw_bytes = base64.b64decode(b64_string)
-        # Convert to "L" for 8-bit grayscale (Luminance)
-        image = Image.open(io.BytesIO(raw_bytes)).convert("L")
-
-        if image.size != (IMAGE_W, IMAGE_H):
-            image = image.resize((IMAGE_W, IMAGE_H), Image.BILINEAR)
-
-        # Convert to numpy array
-        frame = np.array(image, dtype=np.uint8)
+        # Convert raw byte array buffer to numpy layout
+        nparr = np.frombuffer(raw_bytes, np.uint8)
+        # Decode straight to Grayscale matrix
+        frame = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
         
-        # RL models usually expect (H, W, C). Add the channel dimension back.
+        if frame is None:
+            return None
+
+        # Resize efficiently if dimensions mismatch
+        if frame.shape[1] != IMAGE_W or frame.shape[0] != IMAGE_H:
+            frame = cv2.resize(frame, (IMAGE_W, IMAGE_H), interpolation=cv2.INTER_LINEAR)
+
+        # Add tracking channel dimension (H, W, 1)
         return frame[:, :, np.newaxis]
-        
     except Exception as e:
-        print(f"[server] frame decode error: {e}")
+        print(f"[server] fast decode error: {e}")
         return None
-        
-def encode_frame(frame: np.ndarray) -> str:
+
+
+def fast_encode_frame(frame: np.ndarray) -> bytes:
     """
-    Converts a numpy array back into a base64 JPEG string.
-    Automatically handles dimension squeezing, handles grayscale formatting,
-    and upscales clean 28x28 MNIST frames back up to 128x128 for iOS visualization.
+    Compresses a numpy array into raw JPEG binary bytes instantly using OpenCV.
+    Converts Grayscale matrices into standard 3-channel JPEGs for iOS compatibility.
     """
     try:
-        # Drop channel dimension if the array comes out as (28, 28, 1)
         if frame.ndim == 3 and frame.shape[-1] == 1:
             frame = frame.squeeze(axis=-1)
             
         if frame.dtype != np.uint8:
             frame = frame.astype(np.uint8)
 
-        # Detect image layout mode (L for grayscale, RGB for color patterns)
-        mode = "L" if frame.ndim == 2 else "RGB"
-        image = Image.fromarray(frame, mode=mode)
-        
-        # Upscale the VQ-VAE's 28x28 output to the 128x128 expected by iOS.
-        # NEAREST preserves crisp, clear individual retro pixels instead of blurry interpolations.
-        if image.size != (IMAGE_W, IMAGE_H):
-            image = image.resize((IMAGE_W, IMAGE_H), Image.NEAREST)
+        # Upscale clean 28x28 VQ-VAE grid cleanly to 128x128
+        if frame.shape[1] != IMAGE_W or frame.shape[0] != IMAGE_H:
+            frame = cv2.resize(frame, (IMAGE_W, IMAGE_H), interpolation=cv2.INTER_NEAREST)
             
-        buffer = io.BytesIO()
-        image.save(buffer, format="JPEG", quality=70) # Quality 70 to save bandwidth
-        return base64.b64encode(buffer.getvalue()).decode("utf-8")
+        # ── THE FIX: Force Grayscale matrix into standard 3-channel image mapping ──
+        # This duplicates the mono channel across B, G, and R, creating a legal JPEG profile
+        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+            
+        # Encode straight into byte buffer format
+        success, encoded_img = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+        if success:
+            return encoded_img.tobytes()
     except Exception as e:
-        print(f"[server] frame encode error: {e}")
-        return ""
+        print(f"[server] fast encode error: {e}")
+    return b""
 
-def generate_test_pattern(width: int = 128, height: int = 128) -> str:
-    """
-    Generates a 4-quadrant random color test pattern.
-    Useful for checking image orientation and scaling on iOS.
-    """
-    try:
-        # Create 4 random colors
-        colors = np.random.randint(0, 256, (4, 3), dtype=np.uint8)
-        
-        # Create a blank canvas
-        canvas = np.zeros((height, width, 3), dtype=np.uint8)
-        
-        # Fill quadrants
-        h_mid, w_mid = height // 2, width // 2
-        canvas[0:h_mid, 0:w_mid] = colors[0]     # Top-left
-        canvas[0:h_mid, w_mid:] = colors[1]      # Top-right
-        canvas[h_mid:, 0:w_mid] = colors[2]      # Bottom-left
-        canvas[h_mid:, w_mid:] = colors[3]       # Bottom-right
-        
-        # Standard encoding pipeline
-        image = Image.fromarray(canvas)
-        buffer = io.BytesIO()
-        image.save(buffer, format="JPEG")
-        return base64.b64encode(buffer.getvalue()).decode("utf-8")
-    except Exception as e:
-        print(f"[server] test pattern error: {e}")
-        return ""
+# ── WebSocket Binary Endpoint ─────────────────────────────────────────────────
 
-# ── WebSocket endpoint ────────────────────────────────────────────────────────
+# ── WebSocket Binary Endpoint ─────────────────────────────────────────────────
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     client_id = id(ws)
     
-    # Dynamically reads gen.num_codes (64) and gen.GRID_SIZE (7) from your new generator setup
     agent = PolicyAgent(num_codes=gen.num_codes, grid_size=gen.GRID_SIZE)
     _agents[client_id] = agent
+    _grids[client_id] = np.zeros((gen.GRID_SIZE, gen.GRID_SIZE), dtype=np.uint8)
     
-    # Track the "running" reward value between frames
     pending_reward = 0.0
-    print(f"[server] client {client_id} connected (Grid Size: {gen.GRID_SIZE}x{gen.GRID_SIZE})")
+    print(f"[server] Client {client_id} connected seamlessly. Ready for binary stream.")
 
     try:
         while True:
-            raw = await ws.receive_text()
-            msg = json.loads(raw)
-            msg_type = msg.get("type")
+            # 1. Fetch the message type using the underlying framework reader
+            websocket_msg = await ws.receive()
+            
+            # Catch Clean Disconnect Messages Natively
+            if websocket_msg.get("type") == "websocket.disconnect":
+                print(f"[server] client {client_id} sent disconnect flag.")
+                break
 
-            # ── Human reward (Buffered) ──────────────────────────────────────
-            if msg_type == "reward":
-                val = float(msg.get("value", 0))
-                pending_reward += val
-                print(f"[server] buffered human feedback: {val:+.1f} | total pending: {pending_reward:+.1f}")
-                continue # Wait for frame to process and apply
+            # ── BRANCH A: Handle Human Async Reward Tap (Text Message) ───────
+            if "text" in websocket_msg:
+                text_data = websocket_msg["text"]
+                try:
+                    msg = json.loads(text_data)
+                    if msg.get("type") == "reward":
+                        val = float(msg.get("value", 0))
+                        pending_reward += val
+                        print(f"[server] buffered reward: {val:+.1f} | total pending: {pending_reward:+.1f}")
+                except Exception as json_err:
+                    print(f"[server] json parse error: {json_err}")
+                continue
 
-            # ── Incoming frame (The "Step") ──────────────────────────────────
-            elif msg_type == "frame":
-                frame = decode_frame(msg["data"]) 
+            # ── BRANCH B: Handle Raw Swift Camera Frames (Binary Message) ────
+            elif "bytes" in websocket_msg:
+                raw_bytes = websocket_msg["bytes"]
+                if not raw_bytes or len(raw_bytes) == 0:
+                    continue
+                
+                # Decode the raw JPEG bytes directly into a numpy matrix
+                frame = fast_decode_frame(raw_bytes)
                 if frame is None:
+                    print("[server] Warning: Frame processing returned empty array layout.")
                     continue
 
-                # 1. Apply the reward (defaults to 0.0 if reward branch wasn't hit)
+                # 1. Inject Buffered rewards
                 current_step_reward = pending_reward
                 agent.record_reward(current_step_reward)                
 
-                # 2. Select action based on the current frame
-                action_grid  = agent.select_action(frame)
-                action_image = gen.decode_actions(action_grid)
-                encoded_action_image = encode_frame(action_image)
+                # 2. Select model actions
+                chosen_code, active_position = agent.select_action(frame)
+                
+                r = active_position // gen.GRID_SIZE
+                c = active_position % gen.GRID_SIZE
+                _grids[client_id][r, c] = chosen_code
+                
+                # 3. Process image decoding paths via shared backend
+                action_image = gen.decode_actions(_grids[client_id])
+                jpeg_bytes = fast_encode_frame(action_image)
+                
+                if not jpeg_bytes:
+                    print("[server] Warning: Generated image compression returned empty byte string.")
+                    continue
 
-                # 3. Construct response matching iOS 'ActionMessage' struct
-                response = {
-                    "type": "frame",
-                    "action": encoded_action_image,
-                    "action_label": f"R: {current_step_reward:+.1f}",
-                    "step": agent.stats["steps"],
-                }                
-                await ws.send_text(json.dumps(response))
+                # 4. Construct Custom Ultra-Light Binary Protocol Header
+                metadata_header = struct.pack("!IBBf", agent.stats["steps"], r, c, current_step_reward)
+                binary_payload = metadata_header + jpeg_bytes
+                
+                # Push back down the socket explicitly as raw data frames to your Swift listener
+                await ws.send_bytes(binary_payload)
 
-                # 4. Update policy
+                # 5. Run the optimizer update step
                 agent.update()
 
-                # 5. Status Prints
-                print(f"[server] step {agent.stats['steps']} | reward {current_step_reward:+.1f} applied | "
-                      f"stats: {agent.stats}")
-                
-                # 6. Reset buffer for next frame
+                # 6. Housekeeping and reset frame buffer state
+                print(f"[server] step {agent.stats['steps']} | pos ({r},{c}) | reward {current_step_reward:+.1f} | payload sent: {len(binary_payload)} bytes")
                 pending_reward = 0.0
-                
-            else:
-                print(f"[server] unknown message type: {msg_type}")
 
     except WebSocketDisconnect:
-        print(f"[server] client {client_id} disconnected")
+        print(f"[server] Client {client_id} disconnected via ASGI exception context.")
     except Exception as e:
-        print(f"[server] error for client {client_id}: {e}")
+        print(f"[server] unexpected runtime error for client {client_id}: {e}")
     finally:
         _agents.pop(client_id, None)
-        
-# ── HTTP health check ─────────────────────────────────────────────────────────
+        _grids.pop(client_id, None)
+        print(f"[server] cleaned up state resources for client {client_id}")
+
+# ── Health Metrics ────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
-        "connected_clients": len(_agents),
-        "timestamp": time.time(),
-    }
-
+    return {"status": "ok", "connected_clients": len(_agents), "timestamp": time.time()}
 
 @app.get("/stats")
 def stats():
-    return {
-        client_id: agent.stats
-        for client_id, agent in _agents.items()
-    }
+    return {client_id: agent.stats for client_id, agent in _agents.items()}
