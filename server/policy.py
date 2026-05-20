@@ -45,18 +45,25 @@ class ObGD(torch.optim.Optimizer):
                 e = state["e"]
                 # In-place updates are faster
                 e.mul_(gam_lam).add_(p.grad)
-                z_sum.add_(e.abs().sum())
+                # z_sum.add_(e.abs().sum())
+                z_sum.add_(e.pow(2).sum())
 
         # 2. Compute dynamic step size entirely via tensor math (no python scalar stalls)
         group = self.param_groups[0]
         lr = group["lr"]
         kappa = group["kappa"]
         
-        delta_bar = torch.clamp(delta_tensor.abs(), min=1.0)
-        dot_product = delta_bar * z_sum * (lr * kappa)
+        intended_change = kappa * delta_tensor.abs()
+        directional_influence = z_sum + 1e-8
+        
+        # Clip step sizing to avoid dividing by near-zero traces
+        step_size = torch.clamp(intended_change / directional_influence, max=lr)
+
+        # delta_bar = torch.clamp(delta_tensor.abs(), min=1.0)
+        # dot_product = delta_bar * z_sum * (lr * kappa)
         
         # Scale factor calculation: if dot_product > 1.0 choose lr/dot_product else lr
-        step_size = torch.where(dot_product > 1.0, lr / dot_product, lr)
+        # step_size = torch.where(dot_product > 1.0, lr / dot_product, lr)
 
         # 3. Apply gradients and optionally reset
         for group in self.param_groups:
@@ -109,7 +116,6 @@ class SharedActorCritic(nn.Module):
 class StreamingActorCritic(nn.Module):
     """
     Combined backbone architecture to minimize frame preprocessing.
-    Keeps separate weights but handles operations contextually.
     """
     def __init__(self, num_codes: int = 64, hidden: int = 64, grid_size: int = 7):
         super().__init__()
