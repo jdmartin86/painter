@@ -11,6 +11,7 @@ import cv2
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 from policy import PolicyAgent
+from detect_face import compute_reward
 import vqvae_mnist as vqvae
 
 IMAGE_H = 128
@@ -95,7 +96,6 @@ async def websocket_endpoint(ws: WebSocket):
     _agents[client_id] = agent
     _grids[client_id] = np.zeros((gen.GRID_SIZE, gen.GRID_SIZE), dtype=np.uint8)
     
-    pending_reward = 0.0
     print(f"[server] Client {client_id} connected seamlessly. Ready for binary stream.")
 
     try:
@@ -133,6 +133,10 @@ async def websocket_endpoint(ws: WebSocket):
                 if frame is None:
                     print("[server] Warning: Frame processing returned empty array layout.")
                     continue
+                
+                # Detect fact to compute reward
+                current_step_reward = compute_reward(frame)
+                # agent.record_reward(current_step_reward)                
 
                 # 2. Select model actions
                 chosen_code, active_position = agent.select_action(frame)
@@ -161,7 +165,6 @@ async def websocket_endpoint(ws: WebSocket):
 
                 # 6. Housekeeping and reset frame buffer state
                 print(f"[server] step {agent.stats['steps']} | pos ({r},{c}) | reward {current_step_reward:+.1f} | payload sent: {len(binary_payload)} bytes")
-                pending_reward = 0.0
 
     except WebSocketDisconnect:
         print(f"[server] Client {client_id} disconnected via ASGI exception context.")
