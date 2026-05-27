@@ -164,7 +164,7 @@ async def websocket_endpoint(ws: WebSocket):
                 agent.update()
 
                 # 6. Housekeeping and reset frame buffer state
-                print(f"[server] step {agent.stats['steps']} | pos ({r},{c}) | reward {current_step_reward:+.1f} | payload sent: {len(binary_payload)} bytes")
+                print(f"[server] step {agent.stats['steps']} | pos ({r},{c}) | reward {current_step_reward:+.1f} |")
 
     except WebSocketDisconnect:
         print(f"[server] Client {client_id} disconnected via ASGI exception context.")
