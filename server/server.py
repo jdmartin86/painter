@@ -30,7 +30,7 @@ _grids: Dict[int, np.ndarray] = {}
 
 # ── High Speed Frame Processors (No Base64, No PIL) ───────────────────────────
 
-def fast_decode_frame(raw_bytes: bytes) -> np.ndarray | None:
+def decode_frame(raw_bytes: bytes) -> np.ndarray | None:
     """
     Directly converts raw JPEG bytes into a uint8 numpy array using OpenCV.
     Bypasses base64 string decoding and PIL image allocation entirely.
@@ -55,7 +55,7 @@ def fast_decode_frame(raw_bytes: bytes) -> np.ndarray | None:
         return None
 
 
-def fast_encode_frame(frame: np.ndarray) -> bytes:
+def encode_frame(frame: np.ndarray) -> bytes:
     """
     Compresses a numpy array into raw JPEG binary bytes instantly using OpenCV.
     Converts Grayscale matrices into standard 3-channel JPEGs for iOS compatibility.
@@ -129,7 +129,7 @@ async def websocket_endpoint(ws: WebSocket):
                     continue
                 
                 # Decode the raw JPEG bytes directly into a numpy matrix
-                frame = fast_decode_frame(raw_bytes)
+                frame = decode_frame(raw_bytes)
                 if frame is None:
                     print("[server] Warning: Frame processing returned empty array layout.")
                     continue
@@ -147,7 +147,7 @@ async def websocket_endpoint(ws: WebSocket):
                 
                 # 3. Process image decoding paths via shared backend
                 action_image = gen.decode_actions(_grids[client_id])
-                jpeg_bytes = fast_encode_frame(action_image)
+                jpeg_bytes = encode_frame(action_image)
                 
                 if not jpeg_bytes:
                     print("[server] Warning: Generated image compression returned empty byte string.")
