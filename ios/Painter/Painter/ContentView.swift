@@ -38,7 +38,7 @@ final class RLViewModel: NSObject, ObservableObject { // NSObject inheritance re
             guard let self = self else { return }
             switch result {
             case .success:
-                self.statusMessage = "Connecting..."
+                self.statusMessage = "Establishing connection..."
                 self.wsManager.connect(to: self.serverURL)
             case .failure(let error):
                 DispatchQueue.main.async {
@@ -79,7 +79,7 @@ final class RLViewModel: NSObject, ObservableObject { // NSObject inheritance re
         if let error = error {
             triggerAlert(message: "Save failed: \(error.localizedDescription)")
         } else {
-            triggerAlert(message: "Frame saved to Photos library!")
+            triggerAlert(message: "Frame saved!")
         }
     }
     
@@ -115,18 +115,24 @@ extension RLViewModel: WebSocketManagerDelegate {
     func didChangeConnectionState(_ connected: Bool) {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
+            
+            guard self.isConnected != connected else { return }
             self.isConnected = connected
             
             if connected {
                 self.statusMessage = "Connected"
                 self.cameraManager.startCapture()
             } else {
-                self.statusMessage = "Disconnected — retrying…"
+                self.statusMessage = "Connection lost. Retrying in 2s..."
                 self.cameraManager.stopCapture()
                 
+                // Controlled retry loop schedule
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
                     guard let self = self else { return }
+                    // Double check we didn't get reconnected via delegate in the meantime
                     guard !self.isConnected else { return }
+                    
+                    print("[UI] Attempting scheduled reconnection...")
                     self.wsManager.connect(to: self.serverURL)
                 }
             }
@@ -164,56 +170,82 @@ struct ContentView: View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            if let uiImage = viewModel.actionImage {
-                Image(uiImage: uiImage)
-                    .interpolation(.none)
-                    .resizable()
-                    .scaledToFit()
-            } else {
-                CameraPreview(viewModel: viewModel)
-                    .ignoresSafeArea()
-            }
-
-            // HUD Overlay
-            VStack {
-                HStack {
-                    HStack(spacing: 6) {
-                        Circle()
-                            .fill(viewModel.isConnected ? Color.green : Color.red)
-                            .frame(width: 8, height: 8)
-                        Text(viewModel.statusMessage)
+            if viewModel.isConnected {
+                // ── ACTIVE SESSION INTERFACE ──
+                Group {
+                    if let uiImage = viewModel.actionImage {
+                        Image(uiImage: uiImage)
+                            .interpolation(.none)
+                            .resizable()
+                            .scaledToFit()
+                    } else {
+                        CameraPreview(viewModel: viewModel)
+                            .ignoresSafeArea()
+                    }
+                }
+                
+                // HUD Overlay (Only visible when connected)
+                VStack {
+                    HStack {
+                        HStack(spacing: 6) {
+                            Circle()
+                                .fill(Color.green)
+                                .frame(width: 8, height: 8)
+                            Text(viewModel.statusMessage)
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundColor(.white)
+                                .shadow(radius: 2)
+                        }
+                        Spacer()
+                        Text("Frames: \(viewModel.framesSent)")
                             .font(.system(.caption, design: .monospaced))
                             .foregroundColor(.white)
                             .shadow(radius: 2)
                     }
+                    .padding()
+
                     Spacer()
-                    Text("Frames: \(viewModel.framesSent)")
-                        .font(.system(.caption, design: .monospaced))
-                        .foregroundColor(.white)
-                        .shadow(radius: 2)
+
+                    // Controls Row
+                    HStack(spacing: 40) {
+                        Button(action: { viewModel.saveCurrentImage() }) {
+                            Image(systemName: "square.and.arrow.down")
+                                .font(.system(size: 24, weight: .semibold))
+                                .foregroundColor(.white)
+                                .frame(width: 60, height: 60)
+                                .background(Color.white.opacity(0.2), in: Circle())
+                        }
+                        .buttonStyle(.plain)
+
+                        RewardButton(label: "➕", color: .green) {
+                            viewModel.sendReward(+1.0)
+                        }
+                    }
+                    .padding(.bottom, 30)
                 }
-                .padding()
-
-                Spacer()
-
-                // Controls Row
-                HStack(spacing: 40) {
-                    Button(action: { viewModel.saveCurrentImage() }) {
-                        Image(systemName: "square.and.arrow.down")
-                            .font(.system(size: 24, weight: .semibold))
+            } else {
+                // ── STARTUP / RECONNECTING SCREEN ──
+                VStack(spacing: 20) {
+                    Spacer()
+                    
+                    // App Network Status Icon
+                    Image(systemName: "pencil.and.outline")
+                            .font(.system(size: 72)) // Slightly larger looks great for this specific symbol
+                            .foregroundColor(.white)  // A crisp blue theme, or use .white / .accentColor
+                            .symbolEffect(.bounce, options: .repeating) // Creates an active drawing/bouncing effect
+                    
+                    VStack(spacing: 8) {
+                        Text("Connecting to Agent")
+                            .font(.system(.title2, design: .monospaced))
+                            .fontWeight(.bold)
                             .foregroundColor(.white)
-                            .frame(width: 60, height: 60)
-                            .background(Color.white.opacity(0.2), in: Circle())
                     }
-                    .buttonStyle(.plain)
-
-                    RewardButton(label: "➕", color: .green) {
-                        viewModel.sendReward(+1.0)
-                    }
+                    Spacer()
                 }
-                .padding(.bottom, 30)
+                .transition(.opacity.combined(with: .scale(scale: 0.95)))
             }
         }
+        .animation(.easeInOut(duration: 0.4), value: viewModel.isConnected) // Seamless swap transition
         .preferredColorScheme(.dark)
         .onAppear { viewModel.onAppear() }
         .onDisappear { viewModel.onDisappear() }
