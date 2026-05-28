@@ -85,8 +85,6 @@ def encode_frame(frame: np.ndarray) -> bytes:
 
 # ── WebSocket Binary Endpoint ─────────────────────────────────────────────────
 
-# ── WebSocket Binary Endpoint ─────────────────────────────────────────────────
-
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
@@ -117,7 +115,7 @@ async def websocket_endpoint(ws: WebSocket):
                     if msg.get("type") == "reward":
                         current_step_reward = float(msg.get("value", 0))
                         agent.record_reward(current_step_reward)                
-                        print(f"[server] buffered reward: {current_step_reward:+.1f} | total pending: {pending_reward:+.1f}")
+                        print(f"[server] viewer reward: {current_step_reward:+.1f}")
                 except Exception as json_err:
                     print(f"[server] json parse error: {json_err}")
                 continue
@@ -136,7 +134,6 @@ async def websocket_endpoint(ws: WebSocket):
                 
                 # Detect fact to compute reward
                 current_step_reward = compute_reward(frame)
-                # agent.record_reward(current_step_reward)                
 
                 # 2. Select model actions
                 chosen_code, active_position = agent.select_action(frame)
