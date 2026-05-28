@@ -5,13 +5,17 @@ import UIKit
 
 // MARK: - ViewModel
 
-final class RLViewModel: ObservableObject {
+final class RLViewModel: NSObject, ObservableObject { // NSObject inheritance required for photo saving selectors
 
     // UI state
     @Published var actionImage: UIImage? = nil
     @Published var isConnected: Bool = false
     @Published var statusMessage: String = "Not connected"
     @Published var framesSent: Int = 0
+    
+    // Alert Handling for Image Saving
+    @Published var alertMessage: String? = nil
+    @Published var showAlert: Bool = false
 
     // Sub-managers
     let cameraManager = CameraManager()
@@ -20,7 +24,8 @@ final class RLViewModel: ObservableObject {
     // Change this to your server's address
     private let serverURL = "ws://192.168.86.249:8000/ws"
 
-    init() {
+    override init() {
+        super.init()
         cameraManager.delegate = self
         wsManager.delegate = self
     }
@@ -28,11 +33,11 @@ final class RLViewModel: ObservableObject {
     // MARK: - Lifecycle
 
     func onAppear() {
+        UIApplication.shared.isIdleTimerDisabled = true
         cameraManager.setup { [weak self] result in
             guard let self = self else { return }
             switch result {
             case .success:
-                // Start by establishing network state before launching camera frames
                 self.statusMessage = "Connecting..."
                 self.wsManager.connect(to: self.serverURL)
             case .failure(let error):
@@ -54,10 +59,35 @@ final class RLViewModel: ObservableObject {
         cameraManager.makePreviewLayer(for: bounds)
     }
 
-    // MARK: - Reward buttons
+    // MARK: - Core Actions
 
     func sendReward(_ value: Float) {
         wsManager.sendReward(value)
+    }
+    
+    func saveCurrentImage() {
+        guard let imageToSave = actionImage else {
+            triggerAlert(message: "No frame available to save yet.")
+            return
+        }
+        
+        // Targets the photo library utilizing Objective-C dynamic dispatch
+        UIImageWriteToSavedPhotosAlbum(imageToSave, self, #selector(saveImageCallback(_:didFinishSavingWithError:contextInfo:)), nil)
+    }
+    
+    @objc private func saveImageCallback(_ image: UIImage, didFinishSavingWithError error: Error?, contextInfo: UnsafeRawPointer) {
+        if let error = error {
+            triggerAlert(message: "Save failed: \(error.localizedDescription)")
+        } else {
+            triggerAlert(message: "Frame saved to Photos library!")
+        }
+    }
+    
+    private func triggerAlert(message: String) {
+        DispatchQueue.main.async {
+            self.alertMessage = message
+            self.showAlert = true
+        }
     }
 }
 
@@ -72,15 +102,13 @@ extension RLViewModel: CameraManagerDelegate {
     }
 }
 
-// MARK: - WebSocketManagerDelegate Implementation
+// MARK: - WebSocketManagerDelegate
 
 extension RLViewModel: WebSocketManagerDelegate {
-    
     func didReceiveActionImage(_ image: UIImage, step: UInt32, row: UInt8, col: UInt8, reward: Float) {
-        // Silently receive the metadata to keep the network pipeline flowing,
-        // but only publish the image to the UI thread
         DispatchQueue.main.async { [weak self] in
-            self?.actionImage = image
+            guard let self = self else { return }
+            self.actionImage = image
         }
     }
 
@@ -91,7 +119,7 @@ extension RLViewModel: WebSocketManagerDelegate {
             
             if connected {
                 self.statusMessage = "Connected"
-                self.cameraManager.startCapture() // Run frame streaming safely
+                self.cameraManager.startCapture()
             } else {
                 self.statusMessage = "Disconnected — retrying…"
                 self.cameraManager.stopCapture()
@@ -134,29 +162,20 @@ struct ContentView: View {
 
     var body: some View {
         ZStack {
-            // ── Background ──
             Color.black.ignoresSafeArea()
 
-            // ── LAYER 1: The Action Image (Scaled to Fit) ──
-            Group {
-                if let uiImage = viewModel.actionImage {
-                    Image(uiImage: uiImage)
-                        .interpolation(.none) // Keeps the agent's pixels crisp
-                        .resizable()
-                        .scaledToFit()
-                } else {
-                    VStack(spacing: 12) {
-                        ProgressView().tint(.white)
-                        Text("Connecting to Agent...")
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundStyle(.white.opacity(0.6))
-                    }
-                }
+            if let uiImage = viewModel.actionImage {
+                Image(uiImage: uiImage)
+                    .interpolation(.none)
+                    .resizable()
+                    .scaledToFit()
+            } else {
+                CameraPreview(viewModel: viewModel)
+                    .ignoresSafeArea()
             }
 
-            // ── LAYER 2: HUD Overlay ──
+            // HUD Overlay
             VStack {
-                // Top Status Bar
                 HStack {
                     HStack(spacing: 6) {
                         Circle()
@@ -164,34 +183,45 @@ struct ContentView: View {
                             .frame(width: 8, height: 8)
                         Text(viewModel.statusMessage)
                             .font(.system(.caption, design: .monospaced))
-                            .foregroundStyle(.white)
+                            .foregroundColor(.white)
                             .shadow(radius: 2)
                     }
-                    
                     Spacer()
-                    
-                    Text("Frame: \(viewModel.framesSent)")
+                    Text("Frames: \(viewModel.framesSent)")
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundColor(.white)
+                        .shadow(radius: 2)
                 }
-                .font(.system(size: 12, weight: .bold, design: .monospaced))
-                .foregroundStyle(.white)
                 .padding()
-                .background(Color.black.opacity(0.5))
-                
+
                 Spacer()
 
-                // Bottom Controls
-                HStack {
-                    Spacer()
+                // Controls Row
+                HStack(spacing: 40) {
+                    Button(action: { viewModel.saveCurrentImage() }) {
+                        Image(systemName: "square.and.arrow.down")
+                            .font(.system(size: 24, weight: .semibold))
+                            .foregroundColor(.white)
+                            .frame(width: 60, height: 60)
+                            .background(Color.white.opacity(0.2), in: Circle())
+                    }
+                    .buttonStyle(.plain)
+
                     RewardButton(label: "➕", color: .green) {
                         viewModel.sendReward(+1.0)
                     }
-                    Spacer()
                 }
-                .padding(.bottom, 50)
+                .padding(.bottom, 30)
             }
         }
+        .preferredColorScheme(.dark)
         .onAppear { viewModel.onAppear() }
         .onDisappear { viewModel.onDisappear() }
+        .alert("Photo Library", isPresented: $viewModel.showAlert) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text(viewModel.alertMessage ?? "")
+        }
     }
 }
 
@@ -213,8 +243,8 @@ struct RewardButton: View {
             action()
         }) {
             Text(label)
-                .font(.system(size: 36))
-                .frame(width: 72, height: 72)
+                .font(.system(size: 32))
+                .frame(width: 60, height: 60)
                 .background(color, in: Circle())
                 .scaleEffect(pressed ? 0.92 : 1.0)
                 .brightness(pressed ? 0.2 : 0)

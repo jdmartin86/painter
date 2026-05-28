@@ -24,6 +24,21 @@ final class CameraManager: NSObject {
 
     private var lastSentTime: CFTimeInterval = 0
 
+    override init() {
+        super.init()
+        // 1. Observe device orientation changes
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleOrientationChange),
+            name: UIDevice.orientationDidChangeNotification,
+            object: nil
+        )
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
     func setup(completion: @escaping (Result<Void, Error>) -> Void) {
         AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
             guard let self = self else { return }
@@ -34,6 +49,8 @@ final class CameraManager: NSObject {
             self.sessionQueue.async {
                 do {
                     try self.configureSession()
+                    // 2. Set the initial rotation angle immediately after configuration
+                    self.updateRotationAngle()
                     DispatchQueue.main.async { completion(.success(())) }
                 } catch {
                     DispatchQueue.main.async { completion(.failure(error)) }
@@ -46,6 +63,7 @@ final class CameraManager: NSObject {
         captureSession.beginConfiguration()
         captureSession.sessionPreset = .medium
 
+        // Using front camera as per your original configuration
         guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front),
               let input = try? AVCaptureDeviceInput(device: device),
               captureSession.canAddInput(input) else {
@@ -63,13 +81,44 @@ final class CameraManager: NSObject {
         }
         captureSession.addOutput(videoOutput)
 
-        if let connection = videoOutput.connection(with: .video) {
-            if connection.isVideoRotationAngleSupported(90) {
-                connection.videoRotationAngle = 90
-            }
-        }
-
         captureSession.commitConfiguration()
+    }
+
+    // 3. Handle notification and route to session queue
+    @objc private func handleOrientationChange() {
+        sessionQueue.async { [weak self] in
+            self?.updateRotationAngle()
+        }
+    }
+
+    // 4. Calculate and set the rotation angle dynamically
+    private func updateRotationAngle() {
+        guard let connection = videoOutput.connection(with: .video) else { return }
+        
+        let deviceOrientation = UIDevice.current.orientation
+        // Ignore face up, face down, or unknown states to keep the last known good rotation
+        guard deviceOrientation.isValidInterfaceOrientation else { return }
+        
+        // Front camera usually requires a mirrored mapping compared to the back camera
+        let angle: CGFloat
+        switch deviceOrientation {
+        case .portrait:
+            angle = 90
+        case .portraitUpsideDown:
+            angle = 270
+        case .landscapeLeft:
+            // For front camera, landscape left maps to 180
+            angle = 180
+        case .landscapeRight:
+            // For front camera, landscape right maps to 0
+            angle = 0
+        default:
+            angle = 90
+        }
+        
+        if connection.isVideoRotationAngleSupported(angle) {
+            connection.videoRotationAngle = angle
+        }
     }
 
     func startCapture() {
