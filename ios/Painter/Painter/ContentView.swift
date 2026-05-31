@@ -22,7 +22,8 @@ final class RLViewModel: NSObject, ObservableObject { // NSObject inheritance re
     let wsManager = WebSocketManager()
 
     // Change this to your server's address
-    private let serverURL = "ws://192.168.86.249:8000/ws"
+    private let serverURL = "ws://192.168.86.249:8000/ws" // Me
+    //    private let serverURL = "ws://192.168.7.36:8000/ws" // Will's
 
     override init() {
         super.init()
