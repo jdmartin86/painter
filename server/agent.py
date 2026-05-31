@@ -1,221 +1,219 @@
-"""
-agent.py — JAX/Flax RL agent with human-in-the-loop reward.
-
-Architecture:
-  - Small CNN encoder  →  flattened features
-  - MLP policy head    →  discrete action logits
-  - REINFORCE update triggered after each complete episode
-    (episode = buffer fills up OR explicit done signal)
-
-Human reward:
-  The reward sent from the iOS app is accumulated into the current
-  trajectory.  If no human reward arrives for a step, the environment
-  reward defaults to 0.0.  The update uses the sum across the buffer.
-"""
-
-from __future__ import annotations
-
-import threading
-from dataclasses import dataclass, field
-from typing import List, Optional
-
-import jax
-import jax.numpy as jnp
-import flax.linen as nn
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
-import optax
-from flax.training import train_state
 
-# ── Hyperparameters ──────────────────────────────────────────────────────────
+# ── Optimized ObGD Optimizer ──────────────────────────────────────────────────
 
-IMAGE_H = 128
-IMAGE_W = 128
-IMAGE_C = 1
-
-# Discrete action space — customise these labels for your task
-ACTION_LABELS = ["forward", "backward", "turn_left", "turn_right", "stop"]
-NUM_ACTIONS = len(ACTION_LABELS)
-
-BUFFER_SIZE = 32          # steps before a gradient update
-GAMMA = 0.99              # discount factor
-LEARNING_RATE = 3e-4
-
-# ── Network ──────────────────────────────────────────────────────────────────
-
-class PolicyNet(nn.Module):
-    """Tiny CNN → MLP policy that fits comfortably in CPU RAM."""
-
-    num_actions: int
-
-    @nn.compact
-    def __call__(self, x: jax.Array) -> jax.Array:
-        """
-        Args:
-            x: float32 image tensor, shape (H, W, C), values in [0, 1].
-        Returns:
-            logits: shape (num_actions,)
-        """
-        x = nn.Conv(features=32, kernel_size=(3, 3), strides=(2, 2))(x)
-        x = nn.relu(x)
-        x = nn.Conv(features=32, kernel_size=(3, 3), strides=(2, 2))(x)
-        x = nn.relu(x)
-        x = nn.Conv(features=32, kernel_size=(3, 3), strides=(2, 2))(x)
-        x = nn.relu(x)
-        x = x.reshape(-1)
-        x = nn.Dense(256)(x)
-        x = nn.relu(x)
-        x = nn.Dense(self.num_actions)(x)
-        return x
-
-
-# ── Rollout buffer ────────────────────────────────────────────────────────────
-
-@dataclass
-class Transition:
-    obs: np.ndarray        # (H, W, C)  float32
-    action: int
-    log_prob: float
-    reward: float = 0.0    # filled in later by human signal
-
-
-@dataclass
-class RolloutBuffer:
-    transitions: List[Transition] = field(default_factory=list)
-
-    def add(self, t: Transition) -> None:
-        self.transitions.append(t)
-
-    def set_last_reward(self, reward: float) -> None:
-        """Assign reward to the most recently added transition."""
-        if self.transitions:
-            self.transitions[-1].reward = reward
-
-    def is_full(self, capacity: int) -> bool:
-        return len(self.transitions) >= capacity
-
-    def clear(self) -> None:
-        self.transitions.clear()
-
-    def discounted_returns(self, gamma: float) -> np.ndarray:
-        rewards = np.array([t.reward for t in self.transitions], dtype=np.float32)
-        returns = np.zeros_like(rewards)
-        running = 0.0
-        for i in reversed(range(len(rewards))):
-            running = rewards[i] + gamma * running
-            returns[i] = running        
-        return returns
-
-
-# ── Training state ────────────────────────────────────────────────────────────
-
-def create_train_state(rng: jax.Array, learning_rate: float) -> train_state.TrainState:
-    model = PolicyNet(num_actions=NUM_ACTIONS)
-    dummy = jnp.zeros((IMAGE_H, IMAGE_W, IMAGE_C))
-    params = model.init(rng, dummy)
-    tx = optax.adam(learning_rate)
-    return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
-
-
-@jax.jit
-def policy_loss_and_grad(params, apply_fn, obs_batch, actions, returns):
+class ObGD(torch.optim.Optimizer):
     """
-    REINFORCE loss:  -E[ log π(a|s) · G_t ]
+    Vectorized Observed Gradient Descent with eligibility traces.
+    Eliminates internal CPU stalls (.item()) by keeping step sizing on-device.
     """
-    def loss_fn(params):
-        logits = jax.vmap(lambda o: apply_fn(params, o))(obs_batch)
-        log_probs = jax.nn.log_softmax(logits)
-        chosen_log_probs = log_probs[jnp.arange(len(actions)), actions]
-        return -jnp.mean(chosen_log_probs * returns)
+    def __init__(
+        self,
+        params,
+        lr:    float = 1.0,
+        gamma: float = 0.99,
+        lamda: float = 0.8,
+        kappa: float = 2.0,
+    ):
+        defaults = dict(lr=lr, gamma=gamma, lamda=lamda, kappa=kappa)
+        super().__init__(params, defaults)
 
-    loss, grads = jax.value_and_grad(loss_fn)(params)
-    return loss, grads
-
-
-# ── Agent ─────────────────────────────────────────────────────────────────────
-
-class RLAgent:
-    """Thread-safe RL agent.  Inference happens on the WebSocket thread;
-    training happens in a background thread to avoid stalling the server."""
-
-    def __init__(self):
-        rng = jax.random.PRNGKey(0)
-        self.state = create_train_state(rng, LEARNING_RATE)
-        self.buffer = RolloutBuffer()
-        self._lock = threading.Lock()
-        self._step = 0
-        self._total_updates = 0
-
-    def select_action(self, frame: np.ndarray) -> tuple[int, float, str]:
+    @torch.no_grad()
+    def step(self, delta_tensor: torch.Tensor, reset: bool = False):  # type: ignore[override]
         """
-        Args:
-            frame: uint8 numpy array, shape (H, W, C)
-        Returns:
-            action_idx, log_prob, action_label
+        Expects delta_tensor to be a 0-dim scalar tensor on the correct device.
         """
-        obs = frame.astype(np.float32) / 255.0             # normalise to [0,1]
-        logits = self.state.apply_fn(self.state.params, jnp.array(obs))
-        logits_np = np.array(logits)
+        # 1. Update eligibility traces and gather total trace sum entirely on device
+        z_sum = torch.tensor(0.0, device=delta_tensor.device)
 
-        # Sample from the policy distribution
-        probs = np.exp(logits_np - logits_np.max())
-        probs /= probs.sum()
-        action = int(np.random.choice(NUM_ACTIONS, p=probs))
-        log_prob = float(np.log(probs[action] + 1e-8))
+        for group in self.param_groups:
+            gam_lam = group["gamma"] * group["lamda"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = self.state[p]
+                if "e" not in state:
+                    state["e"] = torch.zeros_like(p)
 
-        # Record transition (reward will be patched in later)
-        with self._lock:
-            self.buffer.add(Transition(obs=obs, action=action, log_prob=log_prob))
-            self._step += 1
+                e = state["e"]
+                e.mul_(gam_lam).add_(p.grad)
+                z_sum.add_(e.pow(2).sum())
 
-        return action, log_prob, ACTION_LABELS[action]
+        # 2. Compute dynamic step size entirely via tensor math (no python scalar stalls)
+        group = self.param_groups[0]
+        lr    = group["lr"]
+        kappa = group["kappa"]
 
-    # ── Human reward ─────────────────────────────────────────────────────────
+        intended_change       = kappa * delta_tensor.abs()
+        directional_influence = z_sum + 1e-8
+        step_size = torch.clamp(intended_change / directional_influence, max=lr)
 
-    def record_reward(self, value: float) -> None:
-        """Add a human reward signal to the latest transition."""
-        with self._lock:
-            self.buffer.set_last_reward(value)
+        # 3. Apply gradients and optionally reset
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = self.state[p]
+                e = state["e"]
 
-    # ── Training update ───────────────────────────────────────────────────────
-    def update(self) -> None:
-        # if self.buffer.is_full(BUFFER_SIZE):
-        #     self._run_update()
-        pass
+                # Update parameters: θ ← θ − α' · δ · e
+                p.add_(e * delta_tensor, alpha=-step_size.item() if step_size.dim() > 0 else -step_size)
 
-    def _run_update(self) -> None:
-        """Perform a REINFORCE gradient update in a background thread."""
-        with self._lock:
-            transitions = list(self.buffer.transitions)
-            returns = self.buffer.discounted_returns(GAMMA)
-            self.buffer.clear()
+                if reset:
+                    e.zero_()
 
-        threading.Thread(target=self._update_step,
-                         args=(transitions, returns),
-                         daemon=True).start()
+# ── Stream Actor Critic ──────────────────────────────────────────────────
 
-    def _update_step(self, transitions: List[Transition], returns: np.ndarray) -> None:
-        obs_batch = jnp.array(np.stack([t.obs for t in transitions]))
-        actions   = jnp.array([t.action for t in transitions])
-        returns_j = jnp.array(returns)
+class StreamAC(nn.Module):
+    def __init__(self, num_codes: int = 64,
+                 hidden: int = 64,
+                 grid_size: int = 7,
+                 lr: float = 1.0,
+                 gamma: float = 0.99,
+                 lamda: float = 0.8,
+                 kappa_policy: float = 3.0,
+                 kappa_value: float = 2.0,
+                 entropy_coeff: float = 0.01,
+                 device: str = None):
+        super().__init__()
 
-        loss, grads = policy_loss_and_grad(
-            self.state.params, self.state.apply_fn,
-            obs_batch, actions, returns_j
+        if device is None:
+            if torch.cuda.is_available(): device = "cuda"
+            elif torch.backends.mps.is_available(): device = "mps"
+            else: device = "cpu"
+            print("Device: ", device)
+       
+        self.device = torch.device(device)
+        print("Device: ", self.device)
+
+        self.gamma         = gamma
+        self.grid_size     = grid_size
+        self.entropy_coeff = entropy_coeff
+        self.n_cells = self.grid_size * self.grid_size
+ 
+        feat_dim = hidden * 2  # 128
+ 
+        # Shared CNN backbone
+        self.backbone = nn.Sequential(
+            nn.Conv2d(1, hidden, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(),
+            nn.LayerNorm([hidden, 64, 64]),
+            nn.Conv2d(hidden, hidden * 2, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(),
+            nn.LayerNorm([hidden * 2, 32, 32]),
+            nn.Conv2d(hidden * 2, hidden * 2, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(),
+            nn.LayerNorm([hidden * 2, 16, 16]),
         )
+        self.pool = nn.AdaptiveAvgPool2d(1)
+ 
+        # Shared GRU — stepped grid_size * grid_size times per frame.
+        self.gru = nn.GRUCell(feat_dim, feat_dim)
+ 
+        # Actor and critic heads both read from the same recurrent features.
+        self.network_policy_head = nn.Linear(feat_dim, num_codes)
+        self.network_value_head  = nn.Linear(feat_dim, 1)
+ 
+        self.optimizer_policy = ObGD(
+            list(self.backbone.parameters()) +
+            list(self.gru.parameters()) +
+            list(self.network_policy_head.parameters()),
+            lr=lr, gamma=gamma, lamda=lamda, kappa=kappa_policy,
+        )
+        self.optimizer_value = ObGD(
+            list(self.backbone.parameters()) +
+            list(self.gru.parameters()) +
+            list(self.network_value_head.parameters()),
+            lr=lr, gamma=gamma, lamda=lamda, kappa=kappa_value,
+        )
+ 
+        # Shared recurrent hidden state — persists across frames, never reset
+        self.h: torch.Tensor = torch.zeros(1, feat_dim)
+ 
+        # One-step tracking allocations
+        self._frame_norm:     torch.Tensor = None
+        self._log_prob:       torch.Tensor = None
+        self._entropy:        torch.Tensor = None
+        self._value:          torch.Tensor = None
+        self._current_reward: float        = 0.0
+        self.current_idx                   = 0
+ 
+        self.stats = {"steps": 0, "last_reward": 0.0, "last_delta": 0.0, "last_entropy": 0.0}
+ 
+    def _features(self, x_norm: torch.Tensor):
+        x = self.backbone(x_norm)
+        return self.pool(x).flatten(1)                        # (B, feat_dim)
+ 
+    def _rollout(self, x_norm: torch.Tensor):
+        """
+        Steps the shared GRU across all grid_size² cells, updating self.h.
+ 
+        Returns:
+            all_h: shape (B, grid_size², feat_dim) — hidden state at each cell
+        """
+        features = self._features(x_norm)                     # (B, feat_dim)
+ 
+        all_h = []
+        for _ in range(self.n_cells):
+            self.h = self.gru(features, self.h)
+            all_h.append(self.h)
+ 
+        return torch.stack(all_h, dim=1)                      # (B, N, feat_dim)
+ 
+    def pi(self, x_norm: torch.Tensor):
+        """
+        Returns:
+            all_probs: shape (B, grid_size², num_codes) — softmax over codes
+        """
+        all_h = self._rollout(x_norm)                         # (B, N, feat_dim)
+        logits = self.network_policy_head(all_h)              # (B, N, num_codes) — linear
+        return F.softmax(logits, dim=-1)
+ 
+    def v(self, x_norm: torch.Tensor):
+        """
+        Returns:
+            all_values: shape (B, grid_size²) — linear function of recurrent features
+        """
+        all_h = self._rollout(x_norm)                         # (B, N, feat_dim)
+        return self.network_value_head(all_h).squeeze(-1)     # (B, N)
+ 
+    def sample_action(self, x_norm: torch.Tensor):
+        """
+        Runs the full grid rollout and samples one code per cell.
+ 
+        Returns:
+            grid (Tensor): sampled code indices, shape (grid_size, grid_size)
+        """
+        all_probs = self.pi(x_norm)                           # (B, N, num_codes)
+        dist = torch.distributions.Categorical(all_probs[0])  # batch over N cells
+        return dist.sample().view(self.grid_size, self.grid_size)
+ 
+    def update_params(self, s, a, r, s_prime):
+        s       = torch.tensor(np.array(s), dtype=torch.float32)
+        a       = torch.tensor(np.array(a))
+        r       = torch.tensor(np.array(r))
+        s_prime = torch.tensor(np.array(s_prime), dtype=torch.float32)
+ 
+        # Compute TD error
+        v_s     = self.v(s)[0, -1]        
+        v_prime = self.v(s_prime)[0, -1].detach()
+        delta   = r + self.gamma * v_prime - v_s
+ 
+        # Compute policy loss
+        probs = self.pi(s)
+        dist  = torch.distributions.Categorical(probs)
 
-        with self._lock:
-            self.state = self.state.apply_gradients(grads=grads)
-            self._total_updates += 1
+        log_prob_pi = -(dist.log_prob(a)[0, -1]).sum()
+        entropy_pi  = -self.entropy_coeff * dist.entropy()[0, -1].sum() * torch.sign(delta).item()
+  
+        self.optimizer_value.zero_grad()
+        self.optimizer_policy.zero_grad()
 
-        print(f"[agent] update {self._total_updates:4d} | "
-              f"steps {self._step:6d} | loss {float(loss):.4f}")
+        (-v_s).backward(retain_graph=True)
+        (log_prob_pi + entropy_pi).backward()
 
-    # ── Stats ─────────────────────────────────────────────────────────────────
-
-    @property
-    def stats(self) -> dict:
-        return {
-            "steps": self._step,
-            "updates": self._total_updates,
-            "buffer_len": len(self.buffer.transitions),
-        }
+        self.optimizer_policy.step(delta.detach(), reset=False)
+        self.optimizer_value.step(delta.detach(), reset=False)

@@ -8,9 +8,11 @@ from typing import Dict
 
 import numpy as np
 import cv2  
+import torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
-from policy import PolicyAgent
+# Import the architectural components directly
+from agent import StreamAC
 from detect_face import compute_reward
 import vqvae_mnist as vqvae
 
@@ -24,11 +26,12 @@ app = FastAPI(title="RL Agent Server")
 # Initialize VQ-VAE model architecture
 gen = vqvae.VQVAEGenerator(checkpoint_path="vqvae_mnsit.pth", num_codes=64)
 
-_agents: Dict[int, PolicyAgent] = {}
+# Dedicated client multi-tenant tracking states
+_agents: Dict[int, StreamAC] = {}
 _grids: Dict[int, np.ndarray] = {}  
+_histories: Dict[int, dict] = {}
 
-
-# ── High Speed Frame Processors (No Base64, No PIL) ───────────────────────────
+# ── High Speed Frame Processors ───────────────────────────
 
 def decode_frame(raw_bytes: bytes) -> np.ndarray | None:
     """
@@ -53,7 +56,6 @@ def decode_frame(raw_bytes: bytes) -> np.ndarray | None:
     except Exception as e:
         print(f"[server] fast decode error: {e}")
         return None
-
 
 def encode_frame(frame: np.ndarray) -> bytes:
     """
@@ -90,32 +92,40 @@ async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     client_id = id(ws)
     
-    agent = PolicyAgent(num_codes=gen.num_codes, grid_size=gen.GRID_SIZE)
+    # Instantiate state mapping matching your requested architecture pattern
+    agent = StreamAC(
+        num_codes=gen.num_codes, 
+        grid_size=gen.GRID_SIZE,
+        entropy_coeff=0.01
+    )
     _agents[client_id] = agent
     _grids[client_id] = np.zeros((gen.GRID_SIZE, gen.GRID_SIZE), dtype=np.uint8)
+    _histories[client_id] = {"obs": None, "action": None}
     
     print(f"[server] Client {client_id} connected seamlessly. Ready for binary stream.")
 
     try:
         while True:
-            # 1. Fetch the message type using the underlying framework reader
             websocket_msg = await ws.receive()
             
-            # Catch Clean Disconnect Messages Natively
             if websocket_msg.get("type") == "websocket.disconnect":
                 print(f"[server] client {client_id} sent disconnect flag.")
                 break
 
+            # Local shortcuts to avoid nested dictionary mutations inside loop paths
+            history = _histories[client_id]
+            grid = _grids[client_id]
+
             # ── BRANCH A: Handle Human Async Reward Tap (Text Message) ───────
-            current_step_reward = 0.
+            reward = 0.
             if "text" in websocket_msg:
                 text_data = websocket_msg["text"]
                 try:
                     msg = json.loads(text_data)
                     if msg.get("type") == "reward":
-                        current_step_reward = float(msg.get("value", 0))
-                        agent.record_reward(current_step_reward)                
-                        print(f"[server] viewer reward: {current_step_reward:+.1f}")
+                        reward = float(msg.get("value", 0))
+                        agent.stats["last_reward"] = reward            
+                        print(f"[server] viewer manual reward injection: {reward:+.1f}")
                 except Exception as json_err:
                     print(f"[server] json parse error: {json_err}")
                 continue
@@ -126,50 +136,77 @@ async def websocket_endpoint(ws: WebSocket):
                 if not raw_bytes or len(raw_bytes) == 0:
                     continue
                 
-                # Decode the raw JPEG bytes directly into a numpy matrix
-                frame = decode_frame(raw_bytes)
-                if frame is None:
+                raw_frame = decode_frame(raw_bytes)
+                if raw_frame is None:
                     print("[server] Warning: Frame processing returned empty array layout.")
                     continue
                 
-                # Detect fact to compute reward
-                current_step_reward = compute_reward(frame)
+                # Reshape matrix safely to expected shape (1, 1, H, W)
+                torch_input = torch.tensor(raw_frame, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0) / 255.0
+                next_obs = raw_frame
 
-                # 2. Select model actions
-                chosen_code, active_position = agent.select_action(frame)
+                # Run reward assessment step layout
+                reward = compute_reward(next_obs)
+
+                # Select grid actions by executing forward inference
+                with torch.no_grad():
+                    action_tensor = agent.sample_action(torch_input)
+                    action = action_tensor.cpu().numpy().astype(np.uint8)
+                                                
+                # Run optimization update pass step if a history frame exists
+                if history["obs"] is not None:
+                    try:
+                        # Convert history frames from (128, 128, 1) to explicit 4D tensors (1, 1, 128, 128)
+                        s_tensor = torch.tensor(history["obs"], dtype=torch.float32).permute(2, 0, 1).unsqueeze(0) / 255.0
+                        s_prime_tensor = torch.tensor(next_obs, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0) / 255.0
+
+                        # Flatten action history from (7, 7) to (1, 49) to match Categorical distribution tracking batch shape
+                        flattened_action = history["action"].reshape(1, -1)
+
+                        agent.update_params(
+                            s=s_tensor,
+                            a=flattened_action,
+                            r=reward,
+                            s_prime=s_prime_tensor
+                        )                    
+                    except Exception as train_err:
+                        print(f"[server] Parameter optimization step error skipped: {train_err}")
+
+                # Rotate tracking buffers for the next step sequence
+                history["obs"] = next_obs
+                history["action"] = action
                 
-                r = active_position // gen.GRID_SIZE
-                c = active_position % gen.GRID_SIZE
-                _grids[client_id][r, c] = chosen_code
-                
-                # 3. Process image decoding paths via shared backend
-                action_image = gen.decode_actions(_grids[client_id])
+                # Process image decoding paths via shared generative backend
+                action_image = gen.decode_actions(action)
                 jpeg_bytes = encode_frame(action_image)
                 
                 if not jpeg_bytes:
                     print("[server] Warning: Generated image compression returned empty byte string.")
                     continue
 
-                # 4. Construct Custom Ultra-Light Binary Protocol Header
-                metadata_header = struct.pack("!IBBf", agent.stats["steps"], r, c, current_step_reward)
+                # Construct Custom Ultra-Light Binary Protocol Header
+                # Packs: steps (uint32), padding/placeholders for r/c (uint8), and reward (float)
+                metadata_header = struct.pack("!IBBf", agent.stats["steps"], 0, 0, float(reward))
                 binary_payload = metadata_header + jpeg_bytes
                 
                 # Push back down the socket explicitly as raw data frames to your Swift listener
                 await ws.send_bytes(binary_payload)
 
-                # 5. Run the optimizer update step
-                agent.update()
-
-                # 6. Housekeeping and reset frame buffer state
-                print(f"[server] step {agent.stats['steps']} | pos ({r},{c}) | reward {current_step_reward:+.1f} |")
+                # Housekeeping updates
+                agent.stats["steps"] += 1
+                agent.stats["last_reward"] = reward
+                print(f"[server] step {agent.stats['steps']} | reward {reward:+.1f} |")
 
     except WebSocketDisconnect:
         print(f"[server] Client {client_id} disconnected via ASGI exception context.")
     except Exception as e:
+        import traceback
         print(f"[server] unexpected runtime error for client {client_id}: {e}")
+        traceback.print_exc()
     finally:
         _agents.pop(client_id, None)
         _grids.pop(client_id, None)
+        _histories.pop(client_id, None)
         print(f"[server] cleaned up state resources for client {client_id}")
 
 # ── Health Metrics ────────────────────────────────────────────────────────────
