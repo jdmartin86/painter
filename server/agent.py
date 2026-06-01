@@ -14,7 +14,7 @@ class ObGD(torch.optim.Optimizer):
         self,
         params,
         lr:    float = 1.0,
-        gamma: float = 0.99,
+        gamma: float = 0.999,
         lamda: float = 0.8,
         kappa: float = 2.0,
     ):
@@ -62,6 +62,43 @@ class ObGD(torch.optim.Optimizer):
                 # Update parameters: θ ← θ − α' · δ · e
                 p.add_(e * delta_tensor, alpha=-step_size.item() if step_size.dim() > 0 else -step_size)
 
+                if reset:
+                    e.zero_()
+
+class AdaptiveObGD(torch.optim.Optimizer):
+    def __init__(self, params, lr=1.0, gamma=0.99, lamda=0.8, kappa=2.0, beta2=0.999, eps=1e-8):
+        defaults = dict(lr=lr, gamma=gamma, lamda=lamda, kappa=kappa, beta2=beta2, eps=eps)
+        self.counter = 0
+        super(AdaptiveObGD, self).__init__(params, defaults)
+    def step(self, delta, reset=False):
+        z_sum = 0.0
+        self.counter += 1
+        for group in self.param_groups:
+            for p in group["params"]:
+                state = self.state[p]
+                if len(state) == 0:
+                    state["eligibility_trace"] = torch.zeros_like(p.data)
+                    state["v"] = torch.zeros_like(p.data)
+                e, v = state["eligibility_trace"], state["v"]
+                e.mul_(group["gamma"] * group["lamda"]).add_(p.grad, alpha=1.0)
+
+                v.mul_(group["beta2"]).addcmul_(delta*e, delta*e, value=1.0 - group["beta2"])
+                v_hat = v / (1.0 - group["beta2"] ** self.counter)
+                z_sum += (e / (v_hat + group["eps"]).sqrt()).abs().sum().item()
+
+        delta_bar = max(abs(delta), 1.0)
+        dot_product = delta_bar * z_sum * group["lr"] * group["kappa"]
+        if dot_product > 1:
+            step_size = group["lr"] / dot_product
+        else:
+            step_size = group["lr"]
+
+        for group in self.param_groups:
+            for p in group["params"]:
+                state = self.state[p]
+                v, e = state["v"], state["eligibility_trace"]
+                v_hat = v / (1.0 - group["beta2"] ** self.counter)
+                p.data.addcdiv_(delta * e, (v_hat + group["eps"]).sqrt(), value=-step_size)
                 if reset:
                     e.zero_()
 
@@ -117,19 +154,32 @@ class StreamAC(nn.Module):
         self.network_policy_head = nn.Linear(feat_dim, num_codes)
         self.network_value_head  = nn.Linear(feat_dim, 1)
  
-        self.optimizer_policy = ObGD(
+        # self.optimizer_policy = ObGD(
+        #     list(self.backbone.parameters()) +
+        #     list(self.gru.parameters()) +
+        #     list(self.network_policy_head.parameters()),
+        #     lr=lr, gamma=gamma, lamda=lamda, kappa=kappa_policy,
+        # )
+        # self.optimizer_value = ObGD(
+        #     list(self.backbone.parameters()) +
+        #     list(self.gru.parameters()) +
+        #     list(self.network_value_head.parameters()),
+        #     lr=lr, gamma=gamma, lamda=lamda, kappa=kappa_value,
+        # )
+
+        self.optimizer_policy = AdaptiveObGD(
             list(self.backbone.parameters()) +
             list(self.gru.parameters()) +
             list(self.network_policy_head.parameters()),
             lr=lr, gamma=gamma, lamda=lamda, kappa=kappa_policy,
         )
-        self.optimizer_value = ObGD(
+        self.optimizer_value = AdaptiveObGD(
             list(self.backbone.parameters()) +
             list(self.gru.parameters()) +
             list(self.network_value_head.parameters()),
             lr=lr, gamma=gamma, lamda=lamda, kappa=kappa_value,
         )
- 
+
         # Shared recurrent hidden state — persists across frames, never reset
         self.h: torch.Tensor = torch.zeros(1, feat_dim)
  
@@ -141,7 +191,7 @@ class StreamAC(nn.Module):
         self._current_reward: float        = 0.0
         self.current_idx                   = 0
  
-        self.stats = {"steps": 0, "last_reward": 0.0, "last_delta": 0.0, "last_entropy": 0.0}
+        self.stats = {"steps": 0,  "updates": 0, "last_reward": 0.0, "last_delta": 0.0, "last_entropy": 0.0}
  
     def _features(self, x_norm: torch.Tensor):
         x = self.backbone(x_norm)
@@ -189,7 +239,40 @@ class StreamAC(nn.Module):
         """
         all_probs = self.pi(x_norm)                           # (B, N, num_codes)
         dist = torch.distributions.Categorical(all_probs[0])  # batch over N cells
-        return dist.sample().view(self.grid_size, self.grid_size)
+        action = dist.sample().view(self.grid_size, self.grid_size)
+        # Detach so the inference graph built during sample_action does not
+        # persist into the next update_params call via the shared self.h state.
+        self.h = self.h.detach()
+        return action
+    
+    def greedy_action(self, x_norm: torch.Tensor):
+        """
+        Runs the full grid rollout and selects the highest-probability code per cell.
+
+        Returns:
+            grid (Tensor): greedy code indices, shape (grid_size, grid_size)
+        """
+        all_probs = self.pi(x_norm)                                    # (B, N, num_codes)
+        action = all_probs[0].argmax(dim=-1).view(self.grid_size, self.grid_size)
+        self.h = self.h.detach()
+        return action
+
+    def epsilon_greedy_action(self, x_norm: torch.Tensor, epsilon: float = 0.1):
+        """
+        Runs the full grid rollout and selects greedily with probability (1 - epsilon),
+        otherwise samples uniformly at random per cell.
+
+        Returns:
+            grid (Tensor): code indices, shape (grid_size, grid_size)
+        """
+        all_probs = self.pi(x_norm)                                    # (B, N, num_codes)
+        if torch.rand(1).item() < epsilon:
+            num_codes = all_probs.shape[-1]
+            action = torch.randint(num_codes, (self.grid_size, self.grid_size))
+        else:
+            action = all_probs[0].argmax(dim=-1).view(self.grid_size, self.grid_size)
+        self.h = self.h.detach()
+        return action
  
     def update_params(self, s, a, r, s_prime):
         s       = torch.tensor(np.array(s), dtype=torch.float32)
@@ -217,3 +300,8 @@ class StreamAC(nn.Module):
 
         self.optimizer_policy.step(delta.detach(), reset=False)
         self.optimizer_value.step(delta.detach(), reset=False)
+
+        # Detach self.h so the training graph built this step doesn't chain into
+        # the next step's rollout. Without this, self.h retains a reference into
+        # the freed graph and the second call to .backward() crashes.
+        self.h = self.h.detach()
