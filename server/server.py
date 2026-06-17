@@ -11,6 +11,7 @@ import numpy as np
 import cv2  
 import torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 
 # Import the architectural components directly
 from agent import StreamAC
@@ -23,6 +24,15 @@ IMAGE_W = 128
 # ── App Initialization ────────────────────────────────────────────────────────
 
 app = FastAPI(title="RL Agent Server")
+
+# Allow your separate frontend website to fetch data from this server
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, replace "*" with your website's actual URL
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Initialize VQ-VAE model architecture
 gen = vqvae.VQVAEGenerator(checkpoint_path="vqvae_mnsit.pth", num_codes=64)
@@ -285,3 +295,23 @@ def health():
 @app.get("/stats")
 def stats():
     return {client_id: agent.stats for client_id, agent in _agents.items()}
+
+# ── Health Metrics & Diagnostic Dashboard ──────────────────────────────────────
+
+from fastapi.responses import HTMLResponse
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "connected_clients": len(_agents), "timestamp": time.time()}
+
+@app.get("/stats")
+def stats():
+    # Returns active agent metrics for AJAX polling
+    return {
+        str(client_id): {
+            "steps": agent.stats.get("steps", 0),
+            "updates": agent.stats.get("updates", 0),
+            "last_reward": agent.stats.get("last_reward", 0.0),
+        }
+        for client_id, agent in _agents.items()
+    }

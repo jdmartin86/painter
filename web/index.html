@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>StreamAC RL Diagnostics Client</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body class="bg-gray-900 text-gray-100 font-sans min-h-screen">
+    <div class="container mx-auto px-6 py-8">
+        <div class="flex justify-between items-center border-b border-gray-800 pb-5 mb-8">
+            <div>
+                <h1 class="text-3xl font-extrabold text-white tracking-tight">StreamAC Decoupled Dashboard</h1>
+                <p class="text-sm text-gray-400 mt-1">Standalone Diagnostic Client</p>
+            </div>
+            <div class="flex items-center space-x-3">
+                <span id="status-indicator" class="h-3 w-3 rounded-full bg-red-500 animate-pulse"></span>
+                <span id="status-text" class="text-sm font-medium text-gray-400">Connecting to Backend...</span>
+            </div>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+            <div class="bg-gray-800 p-6 rounded-xl shadow-lg border border-gray-700">
+                <p class="text-sm font-medium text-gray-400 uppercase tracking-wider">Active Stream Tenants</p>
+                <p id="total-clients" class="text-4xl font-bold text-indigo-400 mt-2">0</p>
+            </div>
+            <div class="bg-gray-800 p-6 rounded-xl shadow-lg border border-gray-700">
+                <p class="text-sm font-medium text-gray-400 uppercase tracking-wider">Total Evaluated Steps</p>
+                <p id="total-steps" class="text-4xl font-bold text-emerald-400 mt-2">0</p>
+            </div>
+            <div class="bg-gray-800 p-6 rounded-xl shadow-lg border border-gray-700">
+                <p class="text-sm font-medium text-gray-400 uppercase tracking-wider">Background Gradient Updates</p>
+                <p id="total-updates" class="text-4xl font-bold text-amber-400 mt-2">0</p>
+            </div>
+        </div>
+
+        <div class="grid grid-cols-1 xl:grid-cols-3 gap-8">
+            <div class="xl:col-span-2 bg-gray-800 p-6 rounded-xl shadow-lg border border-gray-700">
+                <h2 class="text-xl font-bold text-white mb-4">Active Clients Telemetry</h2>
+                <div class="overflow-x-auto">
+                    <table class="min-w-full divide-y divide-gray-700">
+                        <thead>
+                            <tr>
+                                <th class="px-4 py-3 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">Client Token (ID)</th>
+                                <th class="px-4 py-3 text-right text-xs font-semibold text-gray-400 uppercase tracking-wider">Steps</th>
+                                <th class="px-4 py-3 text-right text-xs font-semibold text-gray-400 uppercase tracking-wider">Updates</th>
+                                <th class="px-4 py-3 text-right text-xs font-semibold text-gray-400 uppercase tracking-wider">Last Reward</th>
+                            </tr>
+                        </thead>
+                        <tbody id="client-table-body" class="divide-y divide-gray-700">
+                            <tr>
+                                <td colspan="4" class="px-4 py-8 text-center text-gray-500">No active reinforcement learning loops detected.</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="bg-gray-800 p-6 rounded-xl shadow-lg border border-gray-700">
+                <h2 class="text-xl font-bold text-white mb-4">Average Step Rewards</h2>
+                <div class="relative h-64">
+                    <canvas id="rewardChart"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // BACKEND CONFIGURATION: Change this URL to point to your hosted agent server
+        const BACKEND_URL = "http://localhost:8000";
+
+        const ctx = document.getElementById('rewardChart').getContext('2d');
+        const rewardChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [{
+                    label: 'Avg System Reward',
+                    data: [],
+                    borderColor: '#10B981',
+                    backgroundColor: 'rgba(16, 185, 129, 0.1)',
+                    borderWidth: 2,
+                    fill: true,
+                    tension: 0.3
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {
+                    x: { grid: { color: '#374151' }, ticks: { color: '#9CA3AF' } },
+                    y: { grid: { color: '#374151' }, ticks: { color: '#9CA3AF' } }
+                },
+                plugins: { legend: { display: false } }
+            }
+        });
+
+        let historyLogMax = 20;
+        let pollingTick = 0;
+
+        async function updateDiagnostics() {
+            try {
+                const healthRes = await fetch(`${BACKEND_URL}/health`);
+                const healthData = await healthRes.json();
+                
+                const statsRes = await fetch(`${BACKEND_URL}/stats`);
+                const statsData = await statsRes.json();
+
+                document.getElementById('status-indicator').className = "h-3 w-3 rounded-full bg-emerald-500 shadow-lg shadow-emerald-500/50";
+                document.getElementById('status-text').innerText = `Connected to ${BACKEND_URL}`;
+                document.getElementById('status-text').className = "text-sm font-medium text-emerald-400";
+
+                const clientIds = Object.keys(statsData);
+                document.getElementById('total-clients').innerText = clientIds.length;
+
+                let globalSteps = 0;
+                let globalUpdates = 0;
+                let aggregateReward = 0.0;
+
+                const tableBody = document.getElementById('client-table-body');
+                
+                if (clientIds.length === 0) {
+                    tableBody.innerHTML = `<tr><td colspan="4" class="px-4 py-8 text-center text-gray-500">No active reinforcement learning loops detected.</td></tr>`;
+                } else {
+                    let htmlRows = "";
+                    clientIds.forEach(id => {
+                        const client = statsData[id];
+                        globalSteps += client.steps;
+                        globalUpdates += client.updates;
+                        aggregateReward += client.last_reward;
+
+                        const rewardClass = client.last_reward > 0 ? "text-emerald-400" : (client.last_reward < 0 ? "text-rose-400" : "text-gray-400");
+                        const formattedReward = (client.last_reward >= 0 ? "+" : "") + client.last_reward.toFixed(2);
+
+                        htmlRows += `
+                            <tr class="hover:bg-gray-750 transition-colors">
+                                <td class="px-4 py-3 font-mono text-sm text-indigo-300">...${id.toString().slice(-8)}</td>
+                                <td class="px-4 py-3 text-right font-medium text-gray-200">${client.steps.toLocaleString()}</td>
+                                <td class="px-4 py-3 text-right font-medium text-gray-200">${client.updates.toLocaleString()}</td>
+                                <td class="px-4 py-3 text-right font-mono font-bold ${rewardClass}">${formattedReward}</td>
+                            </tr>
+                        `;
+                    });
+                    tableBody.innerHTML = htmlRows;
+                }
+
+                document.getElementById('total-steps').innerText = globalSteps.toLocaleString();
+                document.getElementById('total-updates').innerText = globalUpdates.toLocaleString();
+
+                let averageSystemReward = clientIds.length > 0 ? (aggregateReward / clientIds.length) : 0.0;
+                pollingTick++;
+
+                rewardChart.data.labels.push(pollingTick);
+                rewardChart.data.datasets[0].data.push(averageSystemReward);
+
+                if (rewardChart.data.labels.length > historyLogMax) {
+                    rewardChart.data.labels.shift();
+                    rewardChart.data.datasets[0].data.shift();
+                }
+                rewardChart.update();
+
+            } catch (error) {
+                console.error("Dashboard diagnostic polling runtime fault: ", error);
+                document.getElementById('status-indicator').className = "h-3 w-3 rounded-full bg-red-500 animate-pulse";
+                document.getElementById('status-text').innerText = "Disconnected from Agent Server";
+                document.getElementById('status-text').className = "text-sm font-medium text-red-400";
+            }
+        }
+
+        setInterval(updateDiagnostics, 1000);
+        updateDiagnostics();
+    </script>
+</body>
+</html>

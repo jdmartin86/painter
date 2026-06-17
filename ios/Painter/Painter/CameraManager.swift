@@ -12,7 +12,7 @@ final class CameraManager: NSObject {
 
     weak var delegate: CameraManagerDelegate?
 
-    var targetFPS: Double = 30.0
+    var targetFPS: Double = 10.0
     var outputSize = CGSize(width: 128, height: 128)
     var jpegQuality: CGFloat = 0.6
 
