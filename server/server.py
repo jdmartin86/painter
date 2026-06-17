@@ -12,6 +12,7 @@ import cv2
 import torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 
 # Import the architectural components directly
 from agent import StreamAC
@@ -25,10 +26,10 @@ IMAGE_W = 128
 
 app = FastAPI(title="RL Agent Server")
 
-# Allow your separate frontend website to fetch data from this server
+# 1. Allow a separately hosted frontend client to securely read telemetry data
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, replace "*" with your website's actual URL
+    allow_origins=["*"],  # Allows any standalone dev client (like VS Code Live Server)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -296,22 +297,48 @@ def health():
 def stats():
     return {client_id: agent.stats for client_id, agent in _agents.items()}
 
-# ── Health Metrics & Diagnostic Dashboard ──────────────────────────────────────
+# ── Live-Streaming Image Generators (On-Demand Only) ──────────────────────────
 
-from fastapi.responses import HTMLResponse
+async def get_input_stream(client_id: int):
+    """Streams the raw incoming camera environment frames directly from history."""
+    while True:
+        if client_id in _histories:
+            history = _histories[client_id]
+            raw_frame = history.get("obs")
+            if raw_frame is not None:
+                encoded_bytes = encode_frame(raw_frame)
+                if encoded_bytes:
+                    yield (b'--frame\r\n'b'Content-Type: image/jpeg\r\n\r\n' + encoded_bytes + b'\r\n')
+        else:
+            break
+        await asyncio.sleep(0.04)
 
-@app.get("/health")
-def health():
-    return {"status": "ok", "connected_clients": len(_agents), "timestamp": time.time()}
+async def get_output_stream(client_id: int):
+    """
+    On-Demand Generator: Grabs the current 'action' token state, passes it through 
+    the VQ-VAE decoder, and serves the sharp reconstructed visual output frame.
+    """
+    while True:
+        if client_id in _histories:
+            history = _histories[client_id]
+            action = history.get("action")  # Pulls the active (7, 7) token block layout
+            
+            if action is not None:
+                # Use your existing VQ-VAE decoder setup to construct the visual matrix
+                action_image = gen.decode_actions(action)
+                
+                # Convert the decoded array structure into raw web-ready JPEGs
+                encoded_bytes = encode_frame(action_image)
+                if encoded_bytes:
+                    yield (b'--frame\r\n'b'Content-Type: image/jpeg\r\n\r\n' + encoded_bytes + b'\r\n')
+        else:
+            break
+        await asyncio.sleep(0.04)
 
-@app.get("/stats")
-def stats():
-    # Returns active agent metrics for AJAX polling
-    return {
-        str(client_id): {
-            "steps": agent.stats.get("steps", 0),
-            "updates": agent.stats.get("updates", 0),
-            "last_reward": agent.stats.get("last_reward", 0.0),
-        }
-        for client_id, agent in _agents.items()
-    }
+@app.get("/video_feed/input/{client_id}")
+async def video_feed_input(client_id: int):
+    return StreamingResponse(get_input_stream(client_id), media_type="multipart/x-mixed-replace; boundary=frame")
+
+@app.get("/video_feed/output/{client_id}")
+async def video_feed_output(client_id: int):
+    return StreamingResponse(get_output_stream(client_id), media_type="multipart/x-mixed-replace; boundary=frame")

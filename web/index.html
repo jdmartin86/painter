@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>StreamAC RL Diagnostics Client</title>
+    <title>StreamAC Dual-Stream Diagnostics</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
@@ -11,8 +11,8 @@
     <div class="container mx-auto px-6 py-8">
         <div class="flex justify-between items-center border-b border-gray-800 pb-5 mb-8">
             <div>
-                <h1 class="text-3xl font-extrabold text-white tracking-tight">StreamAC Decoupled Dashboard</h1>
-                <p class="text-sm text-gray-400 mt-1">Standalone Diagnostic Client</p>
+                <h1 class="text-3xl font-extrabold text-white tracking-tight">Agent Dashboard</h1>
+                <p class="text-sm text-gray-400 mt-1">Dual-Stream Input/Output Vision Monitor</p>
             </div>
             <div class="flex items-center space-x-3">
                 <span id="status-indicator" class="h-3 w-3 rounded-full bg-red-500 animate-pulse"></span>
@@ -20,46 +20,72 @@
             </div>
         </div>
 
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
-            <div class="bg-gray-800 p-6 rounded-xl shadow-lg border border-gray-700">
-                <p class="text-sm font-medium text-gray-400 uppercase tracking-wider">Active Stream Tenants</p>
-                <p id="total-clients" class="text-4xl font-bold text-indigo-400 mt-2">0</p>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-8 mb-8">
+            <div class="bg-gray-800 p-6 rounded-xl shadow-lg border border-gray-700 flex flex-col items-center">
+                <div class="w-full mb-4">
+                    <h2 class="text-xl font-bold text-white flex items-center gap-2">
+                        <span class="inline-block w-2 h-2 rounded-full bg-indigo-500"></span>
+                        iOS App Environment Input
+                    </h2>
+                    <p class="text-xs text-gray-400">Raw video buffer arriving via WebSocket</p>
+                </div>
+                <div class="w-full bg-gray-950 rounded-lg overflow-hidden border border-gray-700 aspect-square flex items-center justify-center relative">
+                    <img id="stream-input" class="w-full h-full object-cover hidden" alt="iOS Stream Input" />
+                    <div id="placeholder-input" class="text-sm text-gray-500 font-mono text-center px-4">
+                        Awaiting iOS environment connection...
+                    </div>
+                </div>
             </div>
-            <div class="bg-gray-800 p-6 rounded-xl shadow-lg border border-gray-700">
-                <p class="text-sm font-medium text-gray-400 uppercase tracking-wider">Total Evaluated Steps</p>
-                <p id="total-steps" class="text-4xl font-bold text-emerald-400 mt-2">0</p>
-            </div>
-            <div class="bg-gray-800 p-6 rounded-xl shadow-lg border border-gray-700">
-                <p class="text-sm font-medium text-gray-400 uppercase tracking-wider">Background Gradient Updates</p>
-                <p id="total-updates" class="text-4xl font-bold text-amber-400 mt-2">0</p>
+
+            <div class="bg-gray-800 p-6 rounded-xl shadow-lg border border-gray-700 flex flex-col items-center">
+                <div class="w-full mb-4">
+                    <h2 class="text-xl font-bold text-white flex items-center gap-2">
+                        <span class="inline-block w-2 h-2 rounded-full bg-emerald-500"></span>
+                        Server Decoded Output Grid
+                    </h2>
+                    <p class="text-xs text-gray-400">Matrix grid mapping / model evaluation snapshots</p>
+                </div>
+                <div class="w-full bg-gray-950 rounded-lg overflow-hidden border border-gray-700 aspect-square flex items-center justify-center relative">
+                    <img id="stream-output" class="w-full h-full object-cover hidden" alt="Server Grid Output" />
+                    <div id="placeholder-output" class="text-sm text-gray-500 font-mono text-center px-4">
+                        Awaiting machine learning loop passes...
+                    </div>
+                </div>
             </div>
         </div>
 
         <div class="grid grid-cols-1 xl:grid-cols-3 gap-8">
-            <div class="xl:col-span-2 bg-gray-800 p-6 rounded-xl shadow-lg border border-gray-700">
-                <h2 class="text-xl font-bold text-white mb-4">Active Clients Telemetry</h2>
+            <div class="space-y-4">
+                <div class="bg-gray-800 p-5 rounded-xl border border-gray-700 flex justify-between items-center">
+                    <span class="text-sm font-medium text-gray-400">Active Loops</span>
+                    <span id="total-clients" class="text-2xl font-bold text-indigo-400">0</span>
+                </div>
+                <div class="bg-gray-800 p-5 rounded-xl border border-gray-700 flex justify-between items-center">
+                    <span class="text-sm font-medium text-gray-400">Evaluated Steps</span>
+                    <span id="total-steps" class="text-2xl font-bold text-emerald-400">0</span>
+                </div>
+                <div class="bg-gray-800 p-5 rounded-xl border border-gray-700 flex justify-between items-center">
+                    <span class="text-sm font-medium text-gray-400">Gradient Updates</span>
+                    <span id="total-updates" class="text-2xl font-bold text-amber-400">0</span>
+                </div>
+            </div>
+
+            <div class="bg-gray-800 p-6 rounded-xl border border-gray-700">
+                <h2 class="text-lg font-bold text-white mb-3">Connected Session Map</h2>
                 <div class="overflow-x-auto">
                     <table class="min-w-full divide-y divide-gray-700">
-                        <thead>
+                        <tbody id="client-table-body" class="divide-y divide-gray-700 text-sm">
                             <tr>
-                                <th class="px-4 py-3 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">Client Token (ID)</th>
-                                <th class="px-4 py-3 text-right text-xs font-semibold text-gray-400 uppercase tracking-wider">Steps</th>
-                                <th class="px-4 py-3 text-right text-xs font-semibold text-gray-400 uppercase tracking-wider">Updates</th>
-                                <th class="px-4 py-3 text-right text-xs font-semibold text-gray-400 uppercase tracking-wider">Last Reward</th>
-                            </tr>
-                        </thead>
-                        <tbody id="client-table-body" class="divide-y divide-gray-700">
-                            <tr>
-                                <td colspan="4" class="px-4 py-8 text-center text-gray-500">No active reinforcement learning loops detected.</td>
+                                <td class="py-4 text-center text-gray-500">No active sessions.</td>
                             </tr>
                         </tbody>
                     </table>
                 </div>
             </div>
 
-            <div class="bg-gray-800 p-6 rounded-xl shadow-lg border border-gray-700">
-                <h2 class="text-xl font-bold text-white mb-4">Average Step Rewards</h2>
-                <div class="relative h-64">
+            <div class="bg-gray-800 p-6 rounded-xl border border-gray-700">
+                <h2 class="text-lg font-bold text-white mb-3">System Reward Trend</h2>
+                <div class="relative h-36">
                     <canvas id="rewardChart"></canvas>
                 </div>
             </div>
@@ -67,33 +93,15 @@
     </div>
 
     <script>
-        // BACKEND CONFIGURATION: Change this URL to point to your hosted agent server
         const BACKEND_URL = "http://localhost:8000";
+        let activeStreamClientId = null;
 
+        // Chart Setup
         const ctx = document.getElementById('rewardChart').getContext('2d');
         const rewardChart = new Chart(ctx, {
             type: 'line',
-            data: {
-                labels: [],
-                datasets: [{
-                    label: 'Avg System Reward',
-                    data: [],
-                    borderColor: '#10B981',
-                    backgroundColor: 'rgba(16, 185, 129, 0.1)',
-                    borderWidth: 2,
-                    fill: true,
-                    tension: 0.3
-                }]
-            },
-            options: {
-                responsive: true,
-                maintainAspectRatio: false,
-                scales: {
-                    x: { grid: { color: '#374151' }, ticks: { color: '#9CA3AF' } },
-                    y: { grid: { color: '#374151' }, ticks: { color: '#9CA3AF' } }
-                },
-                plugins: { legend: { display: false } }
-            }
+            data: { labels: [], datasets: [{ data: [], borderColor: '#10B981', borderWidth: 2, fill: false, tension: 0.2 }] },
+            options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { display: false }, y: { grid: { color: '#374151' }, ticks: { color: '#9CA3AF' } } } }
         });
 
         let historyLogMax = 20;
@@ -108,8 +116,7 @@
                 const statsData = await statsRes.json();
 
                 document.getElementById('status-indicator').className = "h-3 w-3 rounded-full bg-emerald-500 shadow-lg shadow-emerald-500/50";
-                document.getElementById('status-text').innerText = `Connected to ${BACKEND_URL}`;
-                document.getElementById('status-text').className = "text-sm font-medium text-emerald-400";
+                document.getElementById('status-text').innerText = `Connected to Agent Server`;
 
                 const clientIds = Object.keys(statsData);
                 document.getElementById('total-clients').innerText = clientIds.length;
@@ -119,26 +126,47 @@
                 let aggregateReward = 0.0;
 
                 const tableBody = document.getElementById('client-table-body');
+                const imgInput = document.getElementById('stream-input');
+                const imgOutput = document.getElementById('stream-output');
+                const placeholderInput = document.getElementById('placeholder-input');
+                const placeholderOutput = document.getElementById('placeholder-output');
                 
                 if (clientIds.length === 0) {
-                    tableBody.innerHTML = `<tr><td colspan="4" class="px-4 py-8 text-center text-gray-500">No active reinforcement learning loops detected.</td></tr>`;
+                    tableBody.innerHTML = `<tr><td class="py-4 text-center text-gray-500">No active sessions.</td></tr>`;
+                    
+                    // Clear visual pipelines when streams vanish
+                    imgInput.classList.add('hidden'); imgInput.src = "";
+                    imgOutput.classList.add('hidden'); imgOutput.src = "";
+                    placeholderInput.classList.remove('hidden');
+                    placeholderOutput.classList.remove('hidden');
+                    activeStreamClientId = null;
                 } else {
                     let htmlRows = "";
+                    
+                    // Bind pipeline endpoints upon discovering a newly established client
+                    if (!activeStreamClientId || !statsData[activeStreamClientId]) {
+                        activeStreamClientId = clientIds[0];
+                        imgInput.src = `${BACKEND_URL}/video_feed/input/${activeStreamClientId}`;
+                        imgOutput.src = `${BACKEND_URL}/video_feed/output/${activeStreamClientId}`;
+                        
+                        imgInput.classList.remove('hidden');
+                        imgOutput.classList.remove('hidden');
+                        placeholderInput.classList.add('hidden');
+                        placeholderOutput.classList.add('hidden');
+                    }
+
                     clientIds.forEach(id => {
                         const client = statsData[id];
                         globalSteps += client.steps;
                         globalUpdates += client.updates;
                         aggregateReward += client.last_reward;
 
-                        const rewardClass = client.last_reward > 0 ? "text-emerald-400" : (client.last_reward < 0 ? "text-rose-400" : "text-gray-400");
-                        const formattedReward = (client.last_reward >= 0 ? "+" : "") + client.last_reward.toFixed(2);
-
+                        const rClass = client.last_reward > 0 ? "text-emerald-400" : (client.last_reward < 0 ? "text-rose-400" : "text-gray-400");
                         htmlRows += `
-                            <tr class="hover:bg-gray-750 transition-colors">
-                                <td class="px-4 py-3 font-mono text-sm text-indigo-300">...${id.toString().slice(-8)}</td>
-                                <td class="px-4 py-3 text-right font-medium text-gray-200">${client.steps.toLocaleString()}</td>
-                                <td class="px-4 py-3 text-right font-medium text-gray-200">${client.updates.toLocaleString()}</td>
-                                <td class="px-4 py-3 text-right font-mono font-bold ${rewardClass}">${formattedReward}</td>
+                            <tr class="hover:bg-gray-750">
+                                <td class="py-2 font-mono text-indigo-300">ID: ...${id.toString().slice(-6)}</td>
+                                <td class="py-2 text-right text-gray-300">Stp: ${client.steps}</td>
+                                <td class="py-2 text-right font-mono font-bold ${rClass}">${client.last_reward >= 0 ? '+' : ''}${client.last_reward.toFixed(1)}</td>
                             </tr>
                         `;
                     });
@@ -150,10 +178,8 @@
 
                 let averageSystemReward = clientIds.length > 0 ? (aggregateReward / clientIds.length) : 0.0;
                 pollingTick++;
-
                 rewardChart.data.labels.push(pollingTick);
                 rewardChart.data.datasets[0].data.push(averageSystemReward);
-
                 if (rewardChart.data.labels.length > historyLogMax) {
                     rewardChart.data.labels.shift();
                     rewardChart.data.datasets[0].data.shift();
@@ -161,10 +187,8 @@
                 rewardChart.update();
 
             } catch (error) {
-                console.error("Dashboard diagnostic polling runtime fault: ", error);
                 document.getElementById('status-indicator').className = "h-3 w-3 rounded-full bg-red-500 animate-pulse";
-                document.getElementById('status-text').innerText = "Disconnected from Agent Server";
-                document.getElementById('status-text').className = "text-sm font-medium text-red-400";
+                document.getElementById('status-text').innerText = "Disconnected from Server";
             }
         }
 
