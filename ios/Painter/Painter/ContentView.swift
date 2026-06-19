@@ -5,13 +5,18 @@ import UIKit
 
 // MARK: - ViewModel
 
-final class RLViewModel: NSObject, ObservableObject { // NSObject inheritance required for photo saving selectors
+final class RLViewModel: NSObject, ObservableObject {
 
     // UI state
     @Published var actionImage: UIImage? = nil
     @Published var isConnected: Bool = false
     @Published var statusMessage: String = "Not connected"
     @Published var framesSent: Int = 0
+    
+    // Countdown state
+    @Published var timeUntilRefresh: Double = 10.0
+    let refreshInterval: TimeInterval = 10.0 // Desired refresh interval (in seconds)
+    private var countdownTimer: Timer?
     
     // Alert Handling for Image Saving
     @Published var alertMessage: String? = nil
@@ -21,14 +26,16 @@ final class RLViewModel: NSObject, ObservableObject { // NSObject inheritance re
     let cameraManager = CameraManager()
     let wsManager = WebSocketManager()
 
-    // Change this to your server's address
-    private let serverURL = "ws://192.168.86.249:8000/ws" // Me
-    //    private let serverURL = "ws://192.168.7.36:8000/ws" // Will's
+    private let serverURL = "ws://192.168.86.249:8000/ws"
 
     override init() {
         super.init()
         cameraManager.delegate = self
         wsManager.delegate = self
+        
+        // Configure the camera to match our target interval
+        cameraManager.targetFPS = 1.0 / refreshInterval
+        timeUntilRefresh = refreshInterval
     }
 
     // MARK: - Lifecycle
@@ -47,11 +54,32 @@ final class RLViewModel: NSObject, ObservableObject { // NSObject inheritance re
                 }
             }
         }
+        startCountdownTimer()
     }
 
     func onDisappear() {
         cameraManager.stopCapture()
         wsManager.disconnect()
+        stopCountdownTimer()
+    }
+    
+    // MARK: - Timer Logic
+    
+    private func startCountdownTimer() {
+        countdownTimer?.invalidate()
+        countdownTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            guard let self = self, self.isConnected else { return }
+            if self.timeUntilRefresh > 0.1 {
+                self.timeUntilRefresh -= 0.1
+            } else {
+                self.timeUntilRefresh = 0.0
+            }
+        }
+    }
+    
+    private func stopCountdownTimer() {
+        countdownTimer?.invalidate()
+        countdownTimer = nil
     }
 
     // MARK: - Camera preview
@@ -71,8 +99,6 @@ final class RLViewModel: NSObject, ObservableObject { // NSObject inheritance re
             triggerAlert(message: "No frame available to save yet.")
             return
         }
-        
-        // Targets the photo library utilizing Objective-C dynamic dispatch
         UIImageWriteToSavedPhotosAlbum(imageToSave, self, #selector(saveImageCallback(_:didFinishSavingWithError:contextInfo:)), nil)
     }
     
@@ -99,6 +125,8 @@ extension RLViewModel: CameraManagerDelegate {
         wsManager.sendFrame(jpegData)
         DispatchQueue.main.async {
             self.framesSent += 1
+            // Reset the countdown track when a frame is successfully dispatched
+            self.timeUntilRefresh = self.refreshInterval
         }
     }
 }
@@ -127,19 +155,16 @@ extension RLViewModel: WebSocketManagerDelegate {
                 self.statusMessage = "Connection lost. Retrying in 2s..."
                 self.cameraManager.stopCapture()
                 
-                // Controlled retry loop schedule
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
                     guard let self = self else { return }
-                    // Double check we didn't get reconnected via delegate in the meantime
                     guard !self.isConnected else { return }
-                    
-                    print("[UI] Attempting scheduled reconnection...")
                     self.wsManager.connect(to: self.serverURL)
                 }
             }
         }
     }
 }
+
 
 // MARK: - Camera Preview (UIViewRepresentable)
 
@@ -198,10 +223,19 @@ struct ContentView: View {
                                 .shadow(radius: 2)
                         }
                         Spacer()
-                        Text("Frames: \(viewModel.framesSent)")
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundColor(.white)
-                            .shadow(radius: 2)
+                        
+                        // Bundled text column displaying frame index and current ticking remaining state
+                        VStack(alignment: .trailing, spacing: 4) {
+                            Text("Frames: \(viewModel.framesSent)")
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundColor(.white)
+                                .shadow(radius: 2)
+                            
+                            Text(String(format: "Refresh: %.1fs", viewModel.timeUntilRefresh))
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundColor(.yellow)
+                                .shadow(radius: 2)
+                        }
                     }
                     .padding()
 
